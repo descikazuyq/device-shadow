@@ -14,20 +14,21 @@ type diskVersion struct {
 
 // diskCampaign 是活动的磁盘格式，设备按提交次序保存。
 type diskCampaign struct {
-	ID          string       `json:"id"`
-	Operator    string       `json:"operator"`
-	Target      string       `json:"target"`
-	CreatedAt   time.Time    `json:"createdAt"`
-	BatchSize   int          `json:"batchSize"`
-	WindowStart time.Time    `json:"windowStart"`
-	WindowEnd   time.Time    `json:"windowEnd"`
-	Deadline    time.Time    `json:"deadline"`
-	LastTime    time.Time    `json:"lastTime"`
-	Status      string       `json:"status"`
-	Ended       bool         `json:"ended"`
-	EndedAt     time.Time    `json:"endedAt,omitempty"`
-	Devices     []diskDev    `json:"devices"`
-	Results     []diskResult `json:"results,omitempty"`
+	ID                string       `json:"id"`
+	Operator          string       `json:"operator"`
+	Target            string       `json:"target"`
+	CreatedAt         time.Time    `json:"createdAt"`
+	BatchSize         int          `json:"batchSize"`
+	WindowStart       time.Time    `json:"windowStart"`
+	WindowEnd         time.Time    `json:"windowEnd"`
+	Deadline          time.Time    `json:"deadline"`
+	RollbackOnFailure bool         `json:"rollbackOnFailure,omitempty"`
+	LastTime          time.Time    `json:"lastTime"`
+	Status            string       `json:"status"`
+	Ended             bool         `json:"ended"`
+	EndedAt           time.Time    `json:"endedAt,omitempty"`
+	Devices           []diskDev    `json:"devices"`
+	Results           []diskResult `json:"results,omitempty"`
 }
 
 type diskOp struct {
@@ -44,14 +45,16 @@ type diskOp struct {
 }
 
 type diskDev struct {
-	DeviceID string    `json:"deviceId"`
-	Batch    int       `json:"batch"`
-	Status   string    `json:"status"`
-	Phase    string    `json:"phase"`
-	Reason   string    `json:"reason,omitempty"`
-	At       time.Time `json:"at,omitempty"`
-	Download diskOp    `json:"download"`
-	Install  diskOp    `json:"install"`
+	DeviceID       string    `json:"deviceId"`
+	Batch          int       `json:"batch"`
+	Status         string    `json:"status"`
+	Phase          string    `json:"phase"`
+	Reason         string    `json:"reason,omitempty"`
+	At             time.Time `json:"at,omitempty"`
+	Download       diskOp    `json:"download"`
+	Install        diskOp    `json:"install"`
+	Rollback       diskOp    `json:"rollback,omitempty"`
+	RollbackTarget string    `json:"rollbackTarget,omitempty"`
 }
 
 type diskResult struct {
@@ -76,30 +79,33 @@ func (s *Store) marshalCampaigns() (map[string]diskCampaign, error) {
 	out := make(map[string]diskCampaign, len(s.campaigns))
 	for id, c := range s.campaigns {
 		dc := diskCampaign{
-			ID:          c.ID,
-			Operator:    c.Operator,
-			Target:      c.Target,
-			CreatedAt:   c.CreatedAt,
-			BatchSize:   c.BatchSize,
-			WindowStart: c.WindowStart,
-			WindowEnd:   c.WindowEnd,
-			Deadline:    c.Deadline,
-			LastTime:    c.LastTime,
-			Status:      c.Status,
-			Ended:       c.Ended,
-			EndedAt:     c.EndedAt,
-			Results:     make([]diskResult, 0, len(c.Results)),
+			ID:                c.ID,
+			Operator:          c.Operator,
+			Target:            c.Target,
+			CreatedAt:         c.CreatedAt,
+			BatchSize:         c.BatchSize,
+			WindowStart:       c.WindowStart,
+			WindowEnd:         c.WindowEnd,
+			Deadline:          c.Deadline,
+			RollbackOnFailure: c.RollbackOnFailure,
+			LastTime:          c.LastTime,
+			Status:            c.Status,
+			Ended:             c.Ended,
+			EndedAt:           c.EndedAt,
+			Results:           make([]diskResult, 0, len(c.Results)),
 		}
 		for _, cd := range c.Devices {
 			dc.Devices = append(dc.Devices, diskDev{
-				DeviceID: cd.DeviceID,
-				Batch:    cd.Batch,
-				Status:   cd.Status,
-				Phase:    cd.Phase,
-				Reason:   cd.Reason,
-				At:       cd.At,
-				Download: encodeOp(cd.Download),
-				Install:  encodeOp(cd.Install),
+				DeviceID:       cd.DeviceID,
+				Batch:          cd.Batch,
+				Status:         cd.Status,
+				Phase:          cd.Phase,
+				Reason:         cd.Reason,
+				At:             cd.At,
+				Download:       encodeOp(cd.Download),
+				Install:        encodeOp(cd.Install),
+				Rollback:       encodeOp(cd.Rollback),
+				RollbackTarget: cd.RollbackTarget,
 			})
 		}
 		for _, r := range c.Results {
@@ -194,19 +200,20 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 			return fmt.Errorf("%w: campaign %s has no devices", ErrCorruptStorage, id)
 		}
 		c := &campaignState{
-			ID:          dc.ID,
-			Operator:    dc.Operator,
-			Target:      dc.Target,
-			CreatedAt:   dc.CreatedAt,
-			BatchSize:   dc.BatchSize,
-			WindowStart: dc.WindowStart,
-			WindowEnd:   dc.WindowEnd,
-			Deadline:    dc.Deadline,
-			LastTime:    dc.LastTime,
-			Status:      dc.Status,
-			Ended:       dc.Ended,
-			EndedAt:     dc.EndedAt,
-			index:       map[string]int{},
+			ID:                dc.ID,
+			Operator:          dc.Operator,
+			Target:            dc.Target,
+			CreatedAt:         dc.CreatedAt,
+			BatchSize:         dc.BatchSize,
+			WindowStart:       dc.WindowStart,
+			WindowEnd:         dc.WindowEnd,
+			Deadline:          dc.Deadline,
+			RollbackOnFailure: dc.RollbackOnFailure,
+			LastTime:          dc.LastTime,
+			Status:            dc.Status,
+			Ended:             dc.Ended,
+			EndedAt:           dc.EndedAt,
+			index:             map[string]int{},
 		}
 		if c.LastTime.IsZero() {
 			c.LastTime = c.CreatedAt
@@ -229,13 +236,31 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 			if !validDeviceStatus(dd.Status) {
 				return fmt.Errorf("%w: campaign %s bad device status", ErrCorruptStorage, id)
 			}
-			if dd.Phase != StageDownload && dd.Phase != StageInstall {
+			if dd.Phase != StageDownload && dd.Phase != StageInstall && dd.Phase != StageRollback {
 				return fmt.Errorf("%w: campaign %s bad phase", ErrCorruptStorage, id)
 			}
 			wantDL := operationID(id, dd.DeviceID, StageDownload)
 			wantIN := operationID(id, dd.DeviceID, StageInstall)
+			wantRB := operationID(id, dd.DeviceID, StageRollback)
 			if dd.Download.ID != wantDL || dd.Install.ID != wantIN {
 				return fmt.Errorf("%w: campaign %s operation id mismatch", ErrCorruptStorage, id)
+			}
+			if dc.RollbackOnFailure {
+				if dd.Rollback.ID != wantRB {
+					return fmt.Errorf("%w: campaign %s rollback op id mismatch", ErrCorruptStorage, id)
+				}
+			} else {
+				// 未开启回滚的活动（含旧存储）不得残留任何回滚进展；
+				// 回滚标识允许缺省（旧存储）或等于稳定标识（新存储）。
+				if dd.Rollback.ID != "" && dd.Rollback.ID != wantRB {
+					return fmt.Errorf("%w: campaign %s rollback op id mismatch", ErrCorruptStorage, id)
+				}
+				if dd.RollbackTarget != "" ||
+					dd.Rollback.Claimed || dd.Rollback.HasResult ||
+					dd.Status == DeviceAwaitingRollback || dd.Status == DeviceRollingBack ||
+					dd.Phase == StageRollback || isRollbackTerminal(dd.Status) {
+					return fmt.Errorf("%w: campaign %s rollback state in non-rollback campaign", ErrCorruptStorage, id)
+				}
 			}
 			// 终态设备必须带时间；失败还须带阶段与原因。
 			if isTerminal(dd.Status) && dd.At.IsZero() {
@@ -243,6 +268,10 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 			}
 			if dd.Status == DeviceFailed && dd.Reason == "" {
 				return fmt.Errorf("%w: campaign %s failure without reason", ErrCorruptStorage, id)
+			}
+			if (dd.Status == DeviceRollbackFailed || dd.Status == DeviceRollbackTimeout ||
+				dd.Status == DeviceAwaitingRollback) && dd.Reason == "" {
+				return fmt.Errorf("%w: campaign %s rollback without reason", ErrCorruptStorage, id)
 			}
 			if dd.Status == DeviceSucceeded &&
 				!(dd.Download.HasResult && dd.Download.Success && dd.Install.HasResult && dd.Install.Success) {
@@ -260,7 +289,11 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 			if dd.Status == DeviceReady && !(dd.Download.HasResult && dd.Download.Success) {
 				return fmt.Errorf("%w: campaign %s ready device without download", ErrCorruptStorage, id)
 			}
-			for _, o := range []diskOp{dd.Download, dd.Install} {
+			ops := []diskOp{dd.Download, dd.Install}
+			if dc.RollbackOnFailure {
+				ops = append(ops, dd.Rollback)
+			}
+			for _, o := range ops {
 				if o.HasResult {
 					if !o.Claimed {
 						return fmt.Errorf("%w: campaign %s unclaimed result", ErrCorruptStorage, id)
@@ -290,15 +323,27 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 					return fmt.Errorf("%w: campaign %s install config invalid", ErrCorruptStorage, id)
 				}
 			}
+			if dc.RollbackOnFailure {
+				if err := validateRollbackDisk(id, dd); err != nil {
+					return err
+				}
+			}
+			rbOp := decodeOp(dd.Rollback)
+			if !dc.RollbackOnFailure {
+				// 与创建路径一致：内存中始终持有稳定的回滚操作标识。
+				rbOp = opState{ID: wantRB}
+			}
 			cd := &campaignDevice{
-				DeviceID: dd.DeviceID,
-				Batch:    dd.Batch,
-				Status:   dd.Status,
-				Phase:    dd.Phase,
-				Reason:   dd.Reason,
-				At:       dd.At,
-				Download: decodeOp(dd.Download),
-				Install:  decodeOp(dd.Install),
+				DeviceID:       dd.DeviceID,
+				Batch:          dd.Batch,
+				Status:         dd.Status,
+				Phase:          dd.Phase,
+				Reason:         dd.Reason,
+				At:             dd.At,
+				Download:       decodeOp(dd.Download),
+				Install:        decodeOp(dd.Install),
+				Rollback:       rbOp,
+				RollbackTarget: dd.RollbackTarget,
 			}
 			c.index[cd.DeviceID] = len(c.Devices)
 			c.Devices = append(c.Devices, cd)
@@ -311,8 +356,11 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 			if _, ok := c.index[dr.DeviceID]; !ok {
 				return fmt.Errorf("%w: campaign %s result device mismatch", ErrCorruptStorage, id)
 			}
-			if dr.Stage != StageDownload && dr.Stage != StageInstall {
+			if dr.Stage != StageDownload && dr.Stage != StageInstall && dr.Stage != StageRollback {
 				return fmt.Errorf("%w: campaign %s result stage invalid", ErrCorruptStorage, id)
+			}
+			if dr.Stage == StageRollback && !dc.RollbackOnFailure {
+				return fmt.Errorf("%w: campaign %s rollback result in non-rollback campaign", ErrCorruptStorage, id)
 			}
 			wantOp := operationID(id, dr.DeviceID, dr.Stage)
 			if dr.OperationID != wantOp {
@@ -359,9 +407,96 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 func validDeviceStatus(status string) bool {
 	switch status {
 	case DevicePending, DeviceDownloading, DeviceReady, DeviceInstalling,
-		DeviceSucceeded, DeviceFailed, DeviceTimeout, DeviceSkipped:
+		DeviceSucceeded, DeviceFailed, DeviceTimeout, DeviceSkipped,
+		DeviceAwaitingRollback, DeviceRollingBack,
+		DeviceRollbackSucceeded, DeviceRollbackFailed, DeviceRollbackTimeout:
 		return true
 	default:
 		return false
 	}
+}
+
+// isRollbackTerminal 判断状态是否属于回滚相关终态。
+func isRollbackTerminal(status string) bool {
+	switch status {
+	case DeviceRollbackSucceeded, DeviceRollbackFailed, DeviceRollbackTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+// isRollbackFlowStatus 判断状态是否处于回滚流程（等待/进行中/任一回滚终态）。
+func isRollbackFlowStatus(status string) bool {
+	switch status {
+	case DeviceAwaitingRollback, DeviceRollingBack,
+		DeviceRollbackSucceeded, DeviceRollbackFailed, DeviceRollbackTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+// validateRollbackDisk 校验开启回滚的活动中单台设备的回滚状态自洽。
+func validateRollbackDisk(campaignID string, dd diskDev) error {
+	bad := func(msg string) error {
+		return fmt.Errorf("%w: campaign %s device %s %s", ErrCorruptStorage, campaignID, dd.DeviceID, msg)
+	}
+	rb := dd.Rollback
+	// 回滚目标只能在首次领取下载时或之后锁定：有目标就必已领取下载。
+	// 反向不成立——领取下载时复查版本不兼容会直接失败，不锁定目标、也不回滚。
+	if dd.RollbackTarget != "" && !dd.Download.Claimed {
+		return bad("rollback target locked before download claim")
+	}
+	// 进入回滚流程的设备必然经过成功下载，目标一定已锁定。
+	if isRollbackFlowStatus(dd.Status) && dd.RollbackTarget == "" {
+		return bad("rollback status without locked target")
+	}
+	switch dd.Status {
+	case DeviceAwaitingRollback:
+		// 已接受安装失败、回滚尚未领取：回滚无结果。
+		if dd.Phase != StageRollback || rb.Claimed || rb.HasResult {
+			return bad("awaiting rollback state mismatch")
+		}
+		if !(dd.Install.HasResult && !dd.Install.Success) {
+			return bad("awaiting rollback without install failure")
+		}
+	case DeviceRollingBack:
+		if dd.Phase != StageRollback || !rb.Claimed || rb.HasResult {
+			return bad("rolling back state mismatch")
+		}
+	case DeviceRollbackSucceeded:
+		if dd.Phase != StageRollback || !rb.HasResult || !rb.Success {
+			return bad("rollback succeeded without success result")
+		}
+		if rb.ResultVersion != dd.RollbackTarget {
+			return bad("rollback version mismatch")
+		}
+		if _, ok := decodeObject(rb.ResultConfig); !ok {
+			return bad("rollback config invalid")
+		}
+	case DeviceRollbackFailed:
+		if dd.Phase != StageRollback || !rb.HasResult || rb.Success || rb.Reason == "" {
+			return bad("rollback failed without failure result")
+		}
+	case DeviceRollbackTimeout:
+		if dd.Phase != StageRollback {
+			return bad("rollback timeout phase mismatch")
+		}
+		// 等待回滚超时（未领取）或正在回滚超时（已领取未完成）都可能。
+		if rb.HasResult {
+			return bad("rollback timeout with result")
+		}
+	default:
+		// 其余状态：开启回滚后安装一旦失败必然进入回滚流程，
+		// 因此这里不能有安装失败，回滚操作也必须从未被领取或提交；
+		// 但回滚目标可能因已领取下载而存在（下载失败/超时/成功等）。
+		if dd.Install.HasResult && !dd.Install.Success {
+			return bad("install failure without rollback state")
+		}
+		if rb.Claimed || rb.HasResult {
+			return bad("rollback progressed without install failure")
+		}
+	}
+	return nil
 }
