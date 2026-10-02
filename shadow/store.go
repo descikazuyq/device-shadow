@@ -75,10 +75,12 @@ func (d *deviceState) refreshDiff(t time.Time) {
 // Store 是本地设备影子存储，所有状态与审计记录保存在指定目录。
 // Store 可安全并发使用。
 type Store struct {
-	mu      sync.Mutex
-	dir     string
-	closed  bool
-	devices map[string]*deviceState
+	mu        sync.Mutex
+	dir       string
+	closed    bool
+	devices   map[string]*deviceState
+	versions  map[string]*versionState
+	campaigns map[string]*campaignState
 }
 
 // Open 打开（必要时创建）位于 dir 的本地影子存储。
@@ -87,7 +89,12 @@ func Open(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("shadow: create store dir: %w", err)
 	}
-	s := &Store{dir: dir, devices: map[string]*deviceState{}}
+	s := &Store{
+		dir:       dir,
+		devices:   map[string]*deviceState{},
+		versions:  map[string]*versionState{},
+		campaigns: map[string]*campaignState{},
+	}
 	data, err := os.ReadFile(s.filePath())
 	if errors.Is(err, fs.ErrNotExist) {
 		return s, nil
@@ -388,8 +395,10 @@ func (s *Store) persist() error {
 
 // diskStore 是存储文件的磁盘格式。
 type diskStore struct {
-	Format  int                  `json:"format"`
-	Devices map[string]diskState `json:"devices"`
+	Format    int                     `json:"format"`
+	Devices   map[string]diskState    `json:"devices"`
+	Versions  map[string]diskVersion  `json:"versions,omitempty"`
+	Campaigns map[string]diskCampaign `json:"campaigns,omitempty"`
 }
 
 type diskState struct {
@@ -439,6 +448,12 @@ func (s *Store) marshal() ([]byte, error) {
 		}
 		disk.Devices[id] = ds
 	}
+	disk.Versions = s.marshalVersions()
+	campaigns, err := s.marshalCampaigns()
+	if err != nil {
+		return nil, err
+	}
+	disk.Campaigns = campaigns
 	data, err := json.Marshal(disk)
 	if err != nil {
 		return nil, fmt.Errorf("shadow: encode store: %w", err)
@@ -504,5 +519,11 @@ func (s *Store) restore(data []byte) error {
 		devices[id] = d
 	}
 	s.devices = devices
+	if err := s.restoreVersions(disk.Versions); err != nil {
+		return err
+	}
+	if err := s.restoreCampaigns(disk.Campaigns); err != nil {
+		return err
+	}
 	return nil
 }
