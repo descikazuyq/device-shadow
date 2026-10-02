@@ -11,6 +11,7 @@ import (
 const (
 	StageDownload = "download"
 	StageInstall  = "install"
+	StageRollback = "rollback"
 )
 
 // 活动与设备在活动中的状态。
@@ -27,6 +28,12 @@ const (
 	DeviceFailed      = "failed"
 	DeviceTimeout     = "timeout"
 	DeviceSkipped     = "skipped" // 前序批次失败后，后续批次记为未执行
+
+	// 仅开启安装失败回滚的活动使用。
+	DeviceRollbackPending   = "rollback_pending"   // 安装失败已接受，等待领取回滚
+	DeviceRollingBack       = "rolling_back"       // 已领取回滚，未完成
+	DeviceRollbackSucceeded = "rollback_succeeded" // 回滚成功（活动最终仍失败）
+	DeviceRollbackFailed    = "rollback_failed"    // 回滚失败
 )
 
 // VersionSpec 是一个已登记的升级目标版本及其允许的当前版本。
@@ -63,6 +70,10 @@ type CampaignSpec struct {
 	WindowEnd   time.Time
 	// Deadline 是截止时间，必须晚于创建时间。
 	Deadline time.Time
+	// RollbackOnFailure 表示是否开启安装失败回滚。默认关闭：关闭时安装失败
+	// 直接记为设备失败，不产生回滚；开启后，安装失败（截止时间前）使设备
+	// 等待回滚，回滚目标为首次领取下载时锁定的设备当前版本。
+	RollbackOnFailure bool
 }
 
 // Operation 是派发给设备的一个升级操作。
@@ -71,8 +82,11 @@ type Operation struct {
 	ID         string
 	CampaignID string
 	DeviceID   string
-	// Kind 是 StageDownload 或 StageInstall。
+	// Kind 是 StageDownload、StageInstall 或 StageRollback。
 	Kind string
+	// Version 仅用于回滚操作（Kind == StageRollback），是设备应恢复到的版本；
+	// 下载与安装操作该字段为空。
+	Version string
 }
 
 // OperationResult 是设备提交的一次操作结果。
@@ -127,6 +141,11 @@ type campaignDevice struct {
 	Batch    int
 	Download opState
 	Install  opState
+	// Rollback 是回滚操作与结果，仅开启失败回滚的活动使用。
+	Rollback opState
+	// RollbackTarget 是首次领取下载时锁定的设备当前版本，作为回滚目标；
+	// 锁定后的普通上报不改变它，也不要求该版本另行登记为升级目标。
+	RollbackTarget string
 	// Status/Phase/Reason/At 描述设备当前状态；
 	// failed 必须记录阶段、原因和时间；timeout/skipped 同理。
 	Status string
@@ -145,9 +164,11 @@ type campaignState struct {
 	WindowStart time.Time
 	WindowEnd   time.Time
 	Deadline    time.Time
-	Devices     []*campaignDevice
-	index       map[string]int
-	Results     []ResultRecord
+	// RollbackOnFailure 表示是否开启安装失败回滚。
+	RollbackOnFailure bool
+	Devices           []*campaignDevice
+	index             map[string]int
+	Results           []ResultRecord
 	// LastTime 是本活动已接受的最晚时间，用于拒绝时间倒退。
 	LastTime time.Time
 	Status   string
@@ -270,21 +291,23 @@ func (s *Store) CreateCampaign(spec CampaignSpec) error {
 			Phase:    StageDownload,
 			Download: opState{ID: operationID(spec.ID, id, StageDownload)},
 			Install:  opState{ID: operationID(spec.ID, id, StageInstall)},
+			Rollback: opState{ID: operationID(spec.ID, id, StageRollback)},
 		})
 	}
 	campaign := &campaignState{
-		ID:          spec.ID,
-		Operator:    spec.Operator,
-		Target:      spec.TargetVersion,
-		CreatedAt:   spec.CreatedAt,
-		BatchSize:   spec.BatchSize,
-		WindowStart: spec.WindowStart,
-		WindowEnd:   spec.WindowEnd,
-		Deadline:    spec.Deadline,
-		Devices:     devs,
-		index:       make(map[string]int, len(devs)),
-		LastTime:    spec.CreatedAt,
-		Status:      CampaignRunning,
+		ID:                spec.ID,
+		Operator:          spec.Operator,
+		Target:            spec.TargetVersion,
+		CreatedAt:         spec.CreatedAt,
+		BatchSize:         spec.BatchSize,
+		WindowStart:       spec.WindowStart,
+		WindowEnd:         spec.WindowEnd,
+		Deadline:          spec.Deadline,
+		RollbackOnFailure: spec.RollbackOnFailure,
+		Devices:           devs,
+		index:             make(map[string]int, len(devs)),
+		LastTime:          spec.CreatedAt,
+		Status:            CampaignRunning,
 	}
 	for i, cd := range devs {
 		campaign.index[cd.DeviceID] = i
@@ -371,6 +394,23 @@ func (s *Store) Claim(campaignID, deviceID string, at time.Time) (*Operation, er
 			op = out
 			return nil
 		}
+		// 安装失败后等待回滚：首次领取回滚须在线且位于原维护窗口 [start, end) 内；
+		// 不与批次放行挂钩。
+		if cd.Status == DeviceRollbackPending {
+			if !s.devices[deviceID].Online {
+				return nil // 离线保留待办，上线后继续
+			}
+			if at.Before(c.WindowStart) || !at.Before(c.WindowEnd) {
+				return nil // 窗口外不派发回滚操作
+			}
+			cd.Rollback.Claimed = true
+			cd.Rollback.ClaimedAt = at
+			cd.Status = DeviceRollingBack
+			cd.At = at
+			op = &Operation{ID: cd.Rollback.ID, CampaignID: c.ID, DeviceID: deviceID,
+				Kind: StageRollback, Version: cd.RollbackTarget}
+			return nil
+		}
 		// 尚未领取的新阶段：先看批次是否放行（不放行时无操作可领）。
 		if !s.batchOpen(c, cd) {
 			return nil
@@ -399,6 +439,11 @@ func (s *Store) Claim(campaignID, deviceID string, at time.Time) (*Operation, er
 			}
 			cd.Download.Claimed = true
 			cd.Download.ClaimedAt = at
+			// 首次领取下载时锁定设备当前版本作为回滚目标；
+			// 锁定后的普通上报不改变它，也不要求该版本另行登记。
+			if c.RollbackOnFailure {
+				cd.RollbackTarget = current
+			}
 			cd.Status = DeviceDownloading
 			cd.At = at
 			op = &Operation{ID: cd.Download.ID, CampaignID: c.ID, DeviceID: deviceID, Kind: StageDownload}
@@ -428,6 +473,9 @@ func outstandingOp(c *campaignState, cd *campaignDevice) *Operation {
 		return &Operation{ID: cd.Download.ID, CampaignID: c.ID, DeviceID: cd.DeviceID, Kind: StageDownload}
 	case cd.Install.Claimed && !cd.Install.HasResult:
 		return &Operation{ID: cd.Install.ID, CampaignID: c.ID, DeviceID: cd.DeviceID, Kind: StageInstall}
+	case cd.Rollback.Claimed && !cd.Rollback.HasResult:
+		return &Operation{ID: cd.Rollback.ID, CampaignID: c.ID, DeviceID: cd.DeviceID,
+			Kind: StageRollback, Version: cd.RollbackTarget}
 	default:
 		return nil
 	}
@@ -472,6 +520,8 @@ func (s *Store) SubmitResult(res OperationResult) error {
 		stage, op = StageDownload, &cd.Download
 	case cd.Install.ID:
 		stage, op = StageInstall, &cd.Install
+	case cd.Rollback.ID:
+		stage, op = StageRollback, &cd.Rollback
 	default:
 		return fmt.Errorf("%w: %s", ErrOperationNotFound, res.OperationID)
 	}
@@ -498,6 +548,11 @@ func (s *Store) SubmitResult(res OperationResult) error {
 			return err
 		}
 	}
+	if res.Success && stage == StageRollback {
+		if err := s.validateRollbackReport(cd, res); err != nil {
+			return err
+		}
+	}
 	var reject error
 	err = s.commit(func() error {
 		// 到达截止时间：未结束设备全部超时并落盘；新结果（非重复）不再接受。
@@ -521,7 +576,52 @@ func (s *Store) SubmitResult(res OperationResult) error {
 		op.Success = res.Success
 		op.Reason = res.Reason
 		op.At = res.At
+		if stage == StageRollback {
+			if !res.Success {
+				// 回滚失败：设备以回滚失败结束，影子不变。
+				cd.Status = DeviceRollbackFailed
+				cd.Phase = StageRollback
+				cd.Reason = res.Reason
+				cd.At = res.At
+				c.Results = append(c.Results, ResultRecord{
+					DeviceID:    cd.DeviceID,
+					OperationID: op.ID,
+					Stage:       StageRollback,
+					Success:     false,
+					Reason:      res.Reason,
+					At:          res.At,
+				})
+				s.settle(c, res.At)
+				return nil
+			}
+			// 回滚成功：附带上报与活动同时更新、一起持久化；
+			// 保留期望配置、修订号与审计，不覆盖期望。
+			s.applyRollbackReport(cd.DeviceID, cd.RollbackTarget, res, res.At)
+			op.ResultSeq = res.Seq
+			op.ResultVersion = res.Version
+			op.ResultConfig = cloneRaw(res.Config)
+			cd.Status = DeviceRollbackSucceeded
+			cd.Phase = StageRollback
+			cd.Reason = ""
+			cd.At = res.At
+			c.Results = append(c.Results, ResultRecord{
+				DeviceID:    cd.DeviceID,
+				OperationID: op.ID,
+				Stage:       StageRollback,
+				Success:     true,
+				Version:     res.Version,
+				At:          res.At,
+			})
+			s.settle(c, res.At)
+			return nil
+		}
 		if !res.Success {
+			if stage == StageInstall && c.RollbackOnFailure {
+				// 安装失败且开启回滚：保存原失败原因与时间，设备等待回滚；
+				// 后续批次立即记为未执行。
+				s.beginRollback(c, cd, res.Reason, res.At)
+				return nil
+			}
 			s.failDevice(c, cd, stage, res.Reason, res.At)
 			return nil
 		}
@@ -614,6 +714,74 @@ func (s *Store) applyInstallReport(deviceID string, res OperationResult, at time
 	d.refreshDiff(at)
 }
 
+// validateRollbackReport 按现有上报规则校验回滚成功附带的设备上报，
+// 且版本必须等于锁定的回滚目标。只校验，不改状态。
+func (s *Store) validateRollbackReport(cd *campaignDevice, res OperationResult) error {
+	d := s.devices[res.DeviceID]
+	if res.Seq == 0 {
+		return fmt.Errorf("%w: report sequence", ErrInvalidReport)
+	}
+	if res.Version == "" {
+		return fmt.Errorf("%w: report version", ErrInvalidReport)
+	}
+	if res.Version != cd.RollbackTarget {
+		return fmt.Errorf("%w: version %s", ErrInvalidReport, res.Version)
+	}
+	if _, err := validateConfig(res.Config); err != nil {
+		return fmt.Errorf("%w: config", ErrInvalidReport)
+	}
+	switch {
+	case res.Seq < d.LastSeq:
+		return fmt.Errorf("%w: stale sequence", ErrInvalidReport)
+	case res.Seq == d.LastSeq:
+		if !(res.Version == d.Version && res.At.Equal(d.LastReportTime) && rawEqual(res.Config, d.Reported)) {
+			return fmt.Errorf("%w: sequence conflict", ErrInvalidReport)
+		}
+	}
+	return nil
+}
+
+// applyRollbackReport 按 Report 的既有规则写入影子（调用方已校验），
+// 把当前版本恢复为锁定的回滚目标。保留期望配置、修订号与审计，不覆盖期望。
+func (s *Store) applyRollbackReport(deviceID, target string, res OperationResult, at time.Time) {
+	d := s.devices[deviceID]
+	if res.Seq == d.LastSeq {
+		// 相同序号的完全重复上报：影子不变，只随活动一起落盘。
+		return
+	}
+	d.Reported = cloneRaw(res.Config)
+	d.Version = target
+	d.Online = true
+	d.LastSeq = res.Seq
+	d.LastReportTime = at
+	d.refreshDiff(at)
+}
+
+// beginRollback 在安装失败且开启回滚时，保存原失败原因与时间，让设备等待回滚；
+// 后续批次立即记为未执行。设备尚未到终态，活动不结束。
+func (s *Store) beginRollback(c *campaignState, cd *campaignDevice, reason string, at time.Time) {
+	cd.Status = DeviceRollbackPending
+	cd.Phase = StageRollback
+	cd.Reason = reason
+	cd.At = at
+	c.Results = append(c.Results, ResultRecord{
+		DeviceID:    cd.DeviceID,
+		OperationID: cd.Install.ID,
+		Stage:       StageInstall,
+		Success:     false,
+		Reason:      reason,
+		At:          at,
+	})
+	for _, other := range c.Devices {
+		if other.Batch > cd.Batch && !isTerminal(other.Status) {
+			other.Status = DeviceSkipped
+			other.Phase = pendingPhase(other)
+			other.Reason = "not executed: previous batch failed"
+			other.At = at
+		}
+	}
+}
+
 // failDevice 将设备记为失败，记录阶段、原因和时间；后续批次全部记为未执行，
 // 本批其他设备继续。若全部设备已到终态，则活动以失败结束。
 func (s *Store) failDevice(c *campaignState, cd *campaignDevice, phase, reason string, at time.Time) {
@@ -647,8 +815,13 @@ func opIDFor(cd *campaignDevice, phase string) string {
 	return cd.Download.ID
 }
 
-// pendingPhase 返回设备尚未完成的阶段：下载成功后停留在安装阶段。
+// pendingPhase 返回设备尚未完成的阶段：回滚等待/进行中停留在回滚阶段；
+// 下载成功后停留在安装阶段。
 func pendingPhase(cd *campaignDevice) string {
+	switch cd.Status {
+	case DeviceRollbackPending, DeviceRollingBack:
+		return StageRollback
+	}
 	if cd.Download.HasResult && cd.Download.Success {
 		return StageInstall
 	}
@@ -665,8 +838,9 @@ func (s *Store) applyTimeout(c *campaignState, at time.Time) {
 		if isTerminal(cd.Status) {
 			continue
 		}
+		phase := pendingPhase(cd) // 先取阶段，再改状态
 		cd.Status = DeviceTimeout
-		cd.Phase = pendingPhase(cd)
+		cd.Phase = phase
 		cd.Reason = "deadline exceeded"
 		cd.At = at
 	}
@@ -697,7 +871,8 @@ func (s *Store) settle(c *campaignState, at time.Time) {
 
 func isTerminal(status string) bool {
 	switch status {
-	case DeviceSucceeded, DeviceFailed, DeviceTimeout, DeviceSkipped:
+	case DeviceSucceeded, DeviceFailed, DeviceTimeout, DeviceSkipped,
+		DeviceRollbackSucceeded, DeviceRollbackFailed:
 		return true
 	default:
 		return false
@@ -769,7 +944,7 @@ type DeviceStatusView struct {
 	Batch    int
 	// Status 取 Device* 状态常量。
 	Status string
-	// Phase 是设备当前停留或失败的阶段（download/install）。
+	// Phase 是设备当前停留或失败的阶段（download/install/rollback）。
 	Phase string
 	// Reason 是失败、超时或未执行（skipped）的原因；成功时为空。
 	Reason string
@@ -778,6 +953,19 @@ type DeviceStatusView struct {
 	// DownloadID/InstallID 是两个阶段操作的稳定标识。
 	DownloadID string
 	InstallID  string
+	// RollbackID 是回滚操作的稳定标识（仅开启失败回滚的活动）。
+	RollbackID string
+	// RollbackTarget 是锁定的回滚目标版本；未开启回滚时为空。
+	RollbackTarget string
+	// RollbackClaimed 表示回滚操作是否已被领取。
+	RollbackClaimed bool
+	// InstallFailReason/InstallFailAt 是安装失败的原因与时间（仅回滚活动），
+	// 与回滚结果的原因、时间分别保存。
+	InstallFailReason string
+	InstallFailAt     time.Time
+	// RollbackReason/RollbackAt 是回滚结果的原因与时间；尚无结果时为空。
+	RollbackReason string
+	RollbackAt     time.Time
 }
 
 // BatchView 是一个批次内所有设备的状态，按提交次序排列。
@@ -796,6 +984,8 @@ type CampaignView struct {
 	WindowStart   time.Time
 	WindowEnd     time.Time
 	Deadline      time.Time
+	// RollbackOnFailure 表示是否开启安装失败回滚。
+	RollbackOnFailure bool
 	// Status 取 Campaign* 状态常量。
 	Status  string
 	Ended   bool
@@ -821,18 +1011,19 @@ func (s *Store) GetCampaign(campaignID string) (CampaignView, error) {
 		return CampaignView{}, err
 	}
 	v := CampaignView{
-		ID:            c.ID,
-		Operator:      c.Operator,
-		TargetVersion: c.Target,
-		CreatedAt:     c.CreatedAt,
-		BatchSize:     c.BatchSize,
-		WindowStart:   c.WindowStart,
-		WindowEnd:     c.WindowEnd,
-		Deadline:      c.Deadline,
-		Status:        c.Status,
-		Ended:         c.Ended,
-		EndedAt:       c.EndedAt,
-		Results:       make([]ResultRecord, len(c.Results)),
+		ID:                c.ID,
+		Operator:          c.Operator,
+		TargetVersion:     c.Target,
+		CreatedAt:         c.CreatedAt,
+		BatchSize:         c.BatchSize,
+		WindowStart:       c.WindowStart,
+		WindowEnd:         c.WindowEnd,
+		Deadline:          c.Deadline,
+		RollbackOnFailure: c.RollbackOnFailure,
+		Status:            c.Status,
+		Ended:             c.Ended,
+		EndedAt:           c.EndedAt,
+		Results:           make([]ResultRecord, len(c.Results)),
 	}
 	copy(v.Results, c.Results)
 	for _, cd := range c.Devices {
@@ -845,6 +1036,15 @@ func (s *Store) GetCampaign(campaignID string) (CampaignView, error) {
 			At:         cd.At,
 			DownloadID: cd.Download.ID,
 			InstallID:  cd.Install.ID,
+		}
+		if c.RollbackOnFailure {
+			dv.RollbackID = cd.Rollback.ID
+			dv.RollbackTarget = cd.RollbackTarget
+			dv.RollbackClaimed = cd.Rollback.Claimed
+			dv.InstallFailReason = cd.Install.Reason
+			dv.InstallFailAt = cd.Install.At
+			dv.RollbackReason = cd.Rollback.Reason
+			dv.RollbackAt = cd.Rollback.At
 		}
 		v.Devices = append(v.Devices, dv)
 		for len(v.Batches) <= cd.Batch {
@@ -866,6 +1066,8 @@ type DeviceWork struct {
 	Pending *Operation
 	// PendingClaimed 表示 Pending 是否已领取（未领取的安装仍须等维护窗口）。
 	PendingClaimed bool
+	// RollbackTarget 是等待回滚时应恢复到的版本；非回滚状态为空。
+	RollbackTarget string
 }
 
 // GetDeviceWork 查询设备当前版本及其待执行操作。
@@ -890,7 +1092,13 @@ func (s *Store) GetDeviceWork(deviceID string) (DeviceWork, error) {
 		}
 		cd := c.Devices[i]
 		w.CampaignID = id
-		if out := outstandingOp(c, cd); out != nil {
+		if cd.Status == DeviceRollbackPending || cd.Status == DeviceRollingBack {
+			// 回滚待办：显示回滚目标与是否已领取。
+			w.Pending = &Operation{ID: cd.Rollback.ID, CampaignID: c.ID, DeviceID: deviceID,
+				Kind: StageRollback, Version: cd.RollbackTarget}
+			w.PendingClaimed = cd.Rollback.Claimed
+			w.RollbackTarget = cd.RollbackTarget
+		} else if out := outstandingOp(c, cd); out != nil {
 			w.Pending = out
 			w.PendingClaimed = true
 		} else if !isTerminal(cd.Status) {
