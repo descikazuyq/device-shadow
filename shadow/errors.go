@@ -78,4 +78,12 @@ var (
 	ErrInvalidReason = errors.New("shadow: failure result requires a reason")
 	// ErrInvalidReport 表示安装成功未附带符合上报规则、版本等于目标版本的设备上报。
 	ErrInvalidReport = errors.New("shadow: install success requires a valid device report at target version")
+
+	// 批量修改期望配置相关错误。
+	// ErrInvalidRequestID 表示批量请求标识为空。
+	ErrInvalidRequestID = errors.New("shadow: request id must not be empty")
+	// ErrRequestConflict 表示同一请求标识被内容不同的批量请求重复使用，原结果保持有效。
+	ErrRequestConflict = errors.New("shadow: request id reused with different content")
+	// ErrRequestNotFound 表示按标识查询的批量请求不存在（含从未成功提交的请求）。
+	ErrRequestNotFound = errors.New("shadow: batch request not found")
 )

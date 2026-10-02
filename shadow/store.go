@@ -38,6 +38,8 @@ type AuditRecord struct {
 	Time     time.Time
 	// Revision 是本次修改产生的新修订号。
 	Revision uint64
+	// RequestID 是产生本次修改的批量请求标识；单设备修改为空。
+	RequestID string
 	// Before 是修改前的完整期望配置。
 	Before json.RawMessage
 	// After 是修改后的完整期望配置。
@@ -81,6 +83,7 @@ type Store struct {
 	devices   map[string]*deviceState
 	versions  map[string]*versionState
 	campaigns map[string]*campaignState
+	batches   map[string]*batchRequestState
 }
 
 // Open 打开（必要时创建）位于 dir 的本地影子存储。
@@ -94,6 +97,7 @@ func Open(dir string) (*Store, error) {
 		devices:   map[string]*deviceState{},
 		versions:  map[string]*versionState{},
 		campaigns: map[string]*campaignState{},
+		batches:   map[string]*batchRequestState{},
 	}
 	data, err := os.ReadFile(s.filePath())
 	if errors.Is(err, fs.ErrNotExist) {
@@ -399,6 +403,7 @@ type diskStore struct {
 	Devices   map[string]diskState    `json:"devices"`
 	Versions  map[string]diskVersion  `json:"versions,omitempty"`
 	Campaigns map[string]diskCampaign `json:"campaigns,omitempty"`
+	Batches   map[string]diskBatch    `json:"batches,omitempty"`
 }
 
 type diskState struct {
@@ -414,11 +419,12 @@ type diskState struct {
 }
 
 type diskAudit struct {
-	Operator string          `json:"operator"`
-	Time     time.Time       `json:"time"`
-	Revision uint64          `json:"revision"`
-	Before   json.RawMessage `json:"before"`
-	After    json.RawMessage `json:"after"`
+	Operator  string          `json:"operator"`
+	Time      time.Time       `json:"time"`
+	Revision  uint64          `json:"revision"`
+	RequestID string          `json:"requestId,omitempty"`
+	Before    json.RawMessage `json:"before"`
+	After     json.RawMessage `json:"after"`
 }
 
 func (s *Store) marshal() ([]byte, error) {
@@ -439,11 +445,12 @@ func (s *Store) marshal() ([]byte, error) {
 		}
 		for _, rec := range d.Audit {
 			ds.Audit = append(ds.Audit, diskAudit{
-				Operator: rec.Operator,
-				Time:     rec.Time,
-				Revision: rec.Revision,
-				Before:   cloneRaw(rec.Before),
-				After:    cloneRaw(rec.After),
+				Operator:  rec.Operator,
+				Time:      rec.Time,
+				Revision:  rec.Revision,
+				RequestID: rec.RequestID,
+				Before:    cloneRaw(rec.Before),
+				After:     cloneRaw(rec.After),
 			})
 		}
 		disk.Devices[id] = ds
@@ -454,6 +461,7 @@ func (s *Store) marshal() ([]byte, error) {
 		return nil, err
 	}
 	disk.Campaigns = campaigns
+	disk.Batches = s.marshalBatches()
 	data, err := json.Marshal(disk)
 	if err != nil {
 		return nil, fmt.Errorf("shadow: encode store: %w", err)
@@ -508,12 +516,13 @@ func (s *Store) restore(data []byte) error {
 			}
 			lastRev = da.Revision
 			d.Audit = append(d.Audit, AuditRecord{
-				DeviceID: id,
-				Operator: da.Operator,
-				Time:     da.Time,
-				Revision: da.Revision,
-				Before:   cloneRaw(da.Before),
-				After:    cloneRaw(da.After),
+				DeviceID:  id,
+				Operator:  da.Operator,
+				Time:      da.Time,
+				Revision:  da.Revision,
+				RequestID: da.RequestID,
+				Before:    cloneRaw(da.Before),
+				After:     cloneRaw(da.After),
 			})
 		}
 		devices[id] = d
@@ -523,6 +532,9 @@ func (s *Store) restore(data []byte) error {
 		return err
 	}
 	if err := s.restoreCampaigns(disk.Campaigns); err != nil {
+		return err
+	}
+	if err := s.restoreBatches(disk.Batches); err != nil {
 		return err
 	}
 	return nil
