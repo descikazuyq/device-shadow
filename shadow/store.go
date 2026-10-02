@@ -12,7 +12,7 @@ import (
 )
 
 const storeFileName = "shadow-store.json"
-const storeFormat = 1
+const storeFormat = 2
 
 // View 是设备影子当前状态的只读快照。
 type View struct {
@@ -75,10 +75,12 @@ func (d *deviceState) refreshDiff(t time.Time) {
 // Store 是本地设备影子存储，所有状态与审计记录保存在指定目录。
 // Store 可安全并发使用。
 type Store struct {
-	mu      sync.Mutex
-	dir     string
-	closed  bool
-	devices map[string]*deviceState
+	mu         sync.Mutex
+	dir        string
+	closed     bool
+	devices    map[string]*deviceState
+	upgrades   map[string]*upgradeRecord
+	activities map[string]*activity
 }
 
 // Open 打开（必要时创建）位于 dir 的本地影子存储。
@@ -87,7 +89,12 @@ func Open(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("shadow: create store dir: %w", err)
 	}
-	s := &Store{dir: dir, devices: map[string]*deviceState{}}
+	s := &Store{
+		dir:        dir,
+		devices:    map[string]*deviceState{},
+		upgrades:   map[string]*upgradeRecord{},
+		activities: map[string]*activity{},
+	}
 	data, err := os.ReadFile(s.filePath())
 	if errors.Is(err, fs.ErrNotExist) {
 		return s, nil
@@ -215,6 +222,15 @@ func (s *Store) Report(deviceID string, seq uint64, at time.Time, version string
 	if err != nil {
 		return err
 	}
+	return s.commit(func() error {
+		return applyReport(d, seq, at, version, cfg)
+	})
+}
+
+// applyReport 把已校验的上报应用到 d。调用方持有 s.mu 并负责持久化。
+// 相同序号、内容一致视为重复，成功返回但不改变状态；
+// 更小序号返回 ErrStaleSequence；相同序号内容不同返回 ErrReportConflict。
+func applyReport(d *deviceState, seq uint64, at time.Time, version string, cfg json.RawMessage) error {
 	switch {
 	case seq < d.LastSeq:
 		return fmt.Errorf("%w: last accepted %d, got %d", ErrStaleSequence, d.LastSeq, seq)
@@ -224,15 +240,13 @@ func (s *Store) Report(deviceID string, seq uint64, at time.Time, version string
 		}
 		return fmt.Errorf("%w: sequence %d", ErrReportConflict, seq)
 	}
-	return s.commit(func() error {
-		d.Reported = cfg
-		d.Version = version
-		d.Online = true
-		d.LastSeq = seq
-		d.LastReportTime = at
-		d.refreshDiff(at)
-		return nil
-	})
+	d.Reported = cfg
+	d.Version = version
+	d.Online = true
+	d.LastSeq = seq
+	d.LastReportTime = at
+	d.refreshDiff(at)
+	return nil
 }
 
 // SetOffline 将设备标为离线。只改变在线状态，保留版本及双方配置。
@@ -388,8 +402,10 @@ func (s *Store) persist() error {
 
 // diskStore 是存储文件的磁盘格式。
 type diskStore struct {
-	Format  int                  `json:"format"`
-	Devices map[string]diskState `json:"devices"`
+	Format     int                      `json:"format"`
+	Devices    map[string]diskState     `json:"devices"`
+	Upgrades   map[string][]string      `json:"upgrades,omitempty"`
+	Activities map[string]*diskActivity `json:"activities,omitempty"`
 }
 
 type diskState struct {
@@ -410,6 +426,41 @@ type diskAudit struct {
 	Revision uint64          `json:"revision"`
 	Before   json.RawMessage `json:"before"`
 	After    json.RawMessage `json:"after"`
+}
+
+type diskActivity struct {
+	ID          string                `json:"id"`
+	Operator    string                `json:"operator"`
+	CreatedAt   time.Time             `json:"createdAt"`
+	Target      string                `json:"target"`
+	WindowStart time.Time             `json:"windowStart"`
+	WindowEnd   time.Time             `json:"windowEnd"`
+	Deadline    time.Time             `json:"deadline"`
+	BatchSize   int                   `json:"batchSize"`
+	LastTime    time.Time             `json:"lastTime,omitempty"`
+	Status      string                `json:"status"`
+	Devices     []*diskActivityDevice `json:"devices"`
+	History     []*diskHistoryEntry   `json:"history,omitempty"`
+}
+
+type diskActivityDevice struct {
+	DeviceID   string    `json:"deviceId"`
+	Batch      int       `json:"batch"`
+	Status     string    `json:"status"`
+	OpID       string    `json:"opId,omitempty"`
+	FailStage  string    `json:"failStage,omitempty"`
+	FailReason string    `json:"failReason,omitempty"`
+	FailTime   time.Time `json:"failTime,omitempty"`
+}
+
+type diskHistoryEntry struct {
+	DeviceID string    `json:"deviceId"`
+	OpID     string    `json:"opId"`
+	Stage    string    `json:"stage"`
+	Success  bool      `json:"success"`
+	Reason   string    `json:"reason,omitempty"`
+	Seq      uint64    `json:"seq,omitempty"`
+	Time     time.Time `json:"time"`
 }
 
 func (s *Store) marshal() ([]byte, error) {
@@ -439,6 +490,50 @@ func (s *Store) marshal() ([]byte, error) {
 		}
 		disk.Devices[id] = ds
 	}
+	disk.Upgrades = make(map[string][]string, len(s.upgrades))
+	for target, rec := range s.upgrades {
+		disk.Upgrades[target] = append([]string(nil), rec.allowed...)
+	}
+	disk.Activities = make(map[string]*diskActivity, len(s.activities))
+	for id, a := range s.activities {
+		da := &diskActivity{
+			ID:          a.id,
+			Operator:    a.operator,
+			CreatedAt:   a.createdAt,
+			Target:      a.target,
+			WindowStart: a.windowStart,
+			WindowEnd:   a.windowEnd,
+			Deadline:    a.deadline,
+			BatchSize:   a.batchSize,
+			LastTime:    a.lastTime,
+			Status:      a.status,
+			Devices:     make([]*diskActivityDevice, 0, len(a.devices)),
+			History:     make([]*diskHistoryEntry, 0, len(a.history)),
+		}
+		for _, d := range a.devices {
+			da.Devices = append(da.Devices, &diskActivityDevice{
+				DeviceID:   d.deviceID,
+				Batch:      d.batch,
+				Status:     d.status,
+				OpID:       d.opID,
+				FailStage:  d.failStage,
+				FailReason: d.failReason,
+				FailTime:   d.failTime,
+			})
+		}
+		for _, h := range a.history {
+			da.History = append(da.History, &diskHistoryEntry{
+				DeviceID: h.deviceID,
+				OpID:     h.opID,
+				Stage:    h.stage,
+				Success:  h.success,
+				Reason:   h.reason,
+				Seq:      h.seq,
+				Time:     h.time,
+			})
+		}
+		disk.Activities[id] = da
+	}
 	data, err := json.Marshal(disk)
 	if err != nil {
 		return nil, fmt.Errorf("shadow: encode store: %w", err)
@@ -453,7 +548,7 @@ func (s *Store) restore(data []byte) error {
 	if err := json.Unmarshal(data, &disk); err != nil {
 		return fmt.Errorf("%w: %v", ErrCorruptStorage, err)
 	}
-	if disk.Format != storeFormat {
+	if disk.Format != 1 && disk.Format != storeFormat {
 		return fmt.Errorf("%w: unsupported format %d", ErrCorruptStorage, disk.Format)
 	}
 	devices := make(map[string]*deviceState, len(disk.Devices))
@@ -504,5 +599,93 @@ func (s *Store) restore(data []byte) error {
 		devices[id] = d
 	}
 	s.devices = devices
+	s.upgrades = make(map[string]*upgradeRecord, len(disk.Upgrades))
+	for target, allowed := range disk.Upgrades {
+		if target == "" {
+			return fmt.Errorf("%w: empty upgrade target", ErrCorruptStorage)
+		}
+		s.upgrades[target] = &upgradeRecord{target: target, allowed: append([]string(nil), allowed...)}
+	}
+	s.activities = make(map[string]*activity, len(disk.Activities))
+	for id, da := range disk.Activities {
+		if id == "" || da.ID != id {
+			return fmt.Errorf("%w: activity id mismatch", ErrCorruptStorage)
+		}
+		if da.Operator == "" || da.CreatedAt.IsZero() || da.WindowStart.IsZero() || da.WindowEnd.IsZero() ||
+			da.Deadline.IsZero() || da.BatchSize <= 0 {
+			return fmt.Errorf("%w: activity %s invalid", ErrCorruptStorage, id)
+		}
+		if !da.WindowStart.Before(da.WindowEnd) || !da.Deadline.After(da.CreatedAt) {
+			return fmt.Errorf("%w: activity %s invalid window/deadline", ErrCorruptStorage, id)
+		}
+		if _, ok := s.upgrades[da.Target]; !ok {
+			return fmt.Errorf("%w: activity %s target not registered", ErrCorruptStorage, id)
+		}
+		a := &activity{
+			id:          da.ID,
+			operator:    da.Operator,
+			createdAt:   da.CreatedAt,
+			target:      da.Target,
+			windowStart: da.WindowStart,
+			windowEnd:   da.WindowEnd,
+			deadline:    da.Deadline,
+			batchSize:   da.BatchSize,
+			lastTime:    da.LastTime,
+			status:      da.Status,
+		}
+		if a.lastTime.IsZero() {
+			a.lastTime = da.CreatedAt
+		}
+		switch da.Status {
+		case ActivityActive, ActivitySucceeded, ActivityFailed:
+		default:
+			return fmt.Errorf("%w: activity %s invalid status", ErrCorruptStorage, id)
+		}
+		seenDev := make(map[string]bool, len(da.Devices))
+		for _, dd := range da.Devices {
+			if dd.DeviceID == "" || seenDev[dd.DeviceID] {
+				return fmt.Errorf("%w: activity %s invalid device", ErrCorruptStorage, id)
+			}
+			seenDev[dd.DeviceID] = true
+			if _, ok := s.devices[dd.DeviceID]; !ok {
+				return fmt.Errorf("%w: activity %s device %s not registered", ErrCorruptStorage, id, dd.DeviceID)
+			}
+			if dd.Batch < 0 || dd.Batch >= a.numBatchesFromLen(len(da.Devices)) {
+				return fmt.Errorf("%w: activity %s device %s invalid batch", ErrCorruptStorage, id, dd.DeviceID)
+			}
+			a.devices = append(a.devices, &activityDevice{
+				deviceID:   dd.DeviceID,
+				batch:      dd.Batch,
+				status:     dd.Status,
+				opID:       dd.OpID,
+				failStage:  dd.FailStage,
+				failReason: dd.FailReason,
+				failTime:   dd.FailTime,
+			})
+		}
+		if len(a.devices) == 0 {
+			return fmt.Errorf("%w: activity %s has no devices", ErrCorruptStorage, id)
+		}
+		for _, h := range da.History {
+			if h.DeviceID == "" || h.OpID == "" || h.Stage == "" || h.Time.IsZero() {
+				return fmt.Errorf("%w: activity %s invalid history", ErrCorruptStorage, id)
+			}
+			a.history = append(a.history, &historyEntry{
+				deviceID: h.DeviceID,
+				opID:     h.OpID,
+				stage:    h.Stage,
+				success:  h.Success,
+				reason:   h.Reason,
+				seq:      h.Seq,
+				time:     h.Time,
+			})
+		}
+		s.activities[id] = a
+	}
 	return nil
+}
+
+// numBatchesFromLen 根据设备总数计算批数。
+func (a *activity) numBatchesFromLen(n int) int {
+	return (n + a.batchSize - 1) / a.batchSize
 }
