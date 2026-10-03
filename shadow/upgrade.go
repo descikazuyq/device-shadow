@@ -586,13 +586,20 @@ func (s *Store) SubmitResult(res OperationResult) error {
 	if !res.Success && res.Reason == "" {
 		return ErrInvalidReason
 	}
+	// 安装/回滚成功附带的设备上报与普通上报共用同一套校验与序号规则，
+	// 只是错误统一归 ErrInvalidReport，且版本必须分别等于活动目标或锁定的
+	// 回滚目标。outcome 与 cfg 在提交前算好，随后在同一次写入中应用。
+	var attachedOutcome reportOutcome
+	var reportCfg json.RawMessage
 	if res.Success && (stage == StageInstall || stage == StageRollback) {
 		// 安装上报版本必须等于升级目标；回滚上报版本必须等于锁定的回滚目标。
 		wantVersion := c.Target
 		if stage == StageRollback {
 			wantVersion = cd.RollbackTarget
 		}
-		if err := s.validateSuccessReport(res, wantVersion); err != nil {
+		var err error
+		attachedOutcome, reportCfg, err = s.validateAttachedReport(res, wantVersion)
+		if err != nil {
 			return err
 		}
 	}
@@ -642,7 +649,7 @@ func (s *Store) SubmitResult(res OperationResult) error {
 			cd.At = res.At
 		case StageInstall:
 			// 安装成功：附带上报与活动同时更新、一起持久化。
-			s.applySuccessReport(cd.DeviceID, res, res.At)
+			s.applyAttachedReport(cd.DeviceID, attachedOutcome, res, reportCfg)
 			op.ResultSeq = res.Seq
 			op.ResultVersion = res.Version
 			op.ResultConfig = cloneRaw(res.Config)
@@ -653,7 +660,7 @@ func (s *Store) SubmitResult(res OperationResult) error {
 		case StageRollback:
 			// 回滚成功：按上报规则更新影子（版本回到锁定目标），同时推进回滚状态。
 			// 期望配置、修订号与审计保持不变。
-			s.applySuccessReport(cd.DeviceID, res, res.At)
+			s.applyAttachedReport(cd.DeviceID, attachedOutcome, res, reportCfg)
 			op.ResultSeq = res.Seq
 			op.ResultVersion = res.Version
 			op.ResultConfig = cloneRaw(res.Config)
@@ -694,48 +701,17 @@ func resultMatches(op *opState, res OperationResult) bool {
 	return true
 }
 
-// validateSuccessReport 按现有上报规则校验安装/回滚成功附带的设备上报，
-// 且版本必须等于 wantVersion（安装为升级目标，回滚为锁定目标）。只校验，不改状态。
-func (s *Store) validateSuccessReport(res OperationResult, wantVersion string) error {
-	d := s.devices[res.DeviceID]
-	if res.Seq == 0 {
-		return fmt.Errorf("%w: report sequence", ErrInvalidReport)
-	}
-	if res.Version == "" {
-		return fmt.Errorf("%w: report version", ErrInvalidReport)
-	}
-	if res.Version != wantVersion {
-		return fmt.Errorf("%w: version %s", ErrInvalidReport, res.Version)
-	}
-	if _, err := validateConfig(res.Config); err != nil {
-		return fmt.Errorf("%w: config", ErrInvalidReport)
-	}
-	switch {
-	case res.Seq < d.LastSeq:
-		return fmt.Errorf("%w: stale sequence", ErrInvalidReport)
-	case res.Seq == d.LastSeq:
-		if !(res.Version == d.Version && res.At.Equal(d.LastReportTime) && rawEqual(res.Config, d.Reported)) {
-			return fmt.Errorf("%w: sequence conflict", ErrInvalidReport)
-		}
-	}
-	return nil
-}
-
-// applySuccessReport 按 Report 的既有规则写入影子（调用方已校验）。
-// 只更新上报侧（版本、上报配置、序号、在线状态与配置差异），
-// 不动期望配置、修订号与审计。
-func (s *Store) applySuccessReport(deviceID string, res OperationResult, at time.Time) {
-	d := s.devices[deviceID]
-	if res.Seq == d.LastSeq {
-		// 相同序号的完全重复上报：影子不变，只随活动一起落盘。
+// applyAttachedReport 在安装/回滚成功的同一次写入中应用附带上报（调用方已
+// 经 validateAttachedReport 校验）。序号更大（reportAccept）时按普通上报规则
+// 写入影子：更新版本、上报配置、序号、在线状态与配置差异；同序号完全重复
+// （reportDuplicate，例如该上报此前已被普通 Report 接受）时影子原样保留——
+// 不刷新在线状态与差异首次出现时间，操作仍照常完成。
+// 只动上报侧，不影响期望配置、修订号与审计。
+func (s *Store) applyAttachedReport(deviceID string, outcome reportOutcome, res OperationResult, cfg json.RawMessage) {
+	if outcome != reportAccept {
 		return
 	}
-	d.Reported = cloneRaw(res.Config)
-	d.Version = res.Version
-	d.Online = true
-	d.LastSeq = res.Seq
-	d.LastReportTime = at
-	d.refreshDiff(at)
+	s.devices[deviceID].applyReport(res.Seq, res.At, res.Version, cfg)
 }
 
 // enterRollback 在开启回滚的活动中处理已接受的安装失败：

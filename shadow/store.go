@@ -226,22 +226,17 @@ func (s *Store) Report(deviceID string, seq uint64, at time.Time, version string
 	if err != nil {
 		return err
 	}
-	switch {
-	case seq < d.LastSeq:
+	switch d.classifyReport(seq, at, version, cfg) {
+	case reportStale:
 		return fmt.Errorf("%w: last accepted %d, got %d", ErrStaleSequence, d.LastSeq, seq)
-	case seq == d.LastSeq:
-		if version == d.Version && at.Equal(d.LastReportTime) && rawEqual(cfg, d.Reported) {
-			return nil // 重复上报：成功返回，不改变状态
-		}
+	case reportConflict:
 		return fmt.Errorf("%w: sequence %d", ErrReportConflict, seq)
+	case reportDuplicate:
+		// 重复上报：成功返回，不重新写入影子，也不改变在线状态。
+		return nil
 	}
 	return s.commit(func() error {
-		d.Reported = cfg
-		d.Version = version
-		d.Online = true
-		d.LastSeq = seq
-		d.LastReportTime = at
-		d.refreshDiff(at)
+		d.applyReport(seq, at, version, cfg)
 		return nil
 	})
 }
