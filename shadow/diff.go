@@ -3,12 +3,17 @@ package shadow
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"math/big"
 	"reflect"
 	"sort"
 	"strings"
 	"time"
 )
+
+// errTrailingJSON 表示第一个完整 JSON 值之后还存在第二个值或其他非空白文本。
+var errTrailingJSON = errors.New("shadow: trailing content after JSON value")
 
 // DiffEntry 描述期望配置与上报配置之间的一处差异。
 type DiffEntry struct {
@@ -87,15 +92,21 @@ func escapePointer(s string) string {
 	return s
 }
 
-// decodeObject 把 raw 解析为 JSON 对象；raw 非对象时返回 false。
+// decodeObject 把 raw 解析为 JSON 对象；raw 不是单一 JSON 对象时返回 false。
+// 对象前后允许 JSON 标准空白（空格、制表符、回车、换行）；对象结束后若还有
+// 第二个 JSON 值或其他非空白文本，同样视为非法。字符串字段中的花括号属于
+// 字段值，不影响判定。
 func decodeObject(raw json.RawMessage) (map[string]json.RawMessage, bool) {
-	trimmed := bytes.TrimSpace(raw)
+	trimmed := bytes.TrimLeft(raw, " \t\r\n")
 	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return nil, false
 	}
 	var obj map[string]json.RawMessage
-	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	if err := dec.Decode(&obj); err != nil {
+		return nil, false
+	}
+	if err := assertSingleValue(dec); err != nil {
 		return nil, false
 	}
 	if obj == nil { // "null" 已通过首字符排除，这里防御性处理
@@ -106,6 +117,17 @@ func decodeObject(raw json.RawMessage) (map[string]json.RawMessage, bool) {
 
 func asObject(raw json.RawMessage) (map[string]json.RawMessage, bool) {
 	return decodeObject(raw)
+}
+
+// assertSingleValue 确认解码器读完一个完整 JSON 值后只剩 JSON 空白：
+// 第二个值解码成功（err == nil）或尾随文本无法解析（任何非 io.EOF 错误）
+// 都表示输入不是单一 JSON 值，必须拒绝。
+func assertSingleValue(dec *json.Decoder) error {
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		return errTrailingJSON
+	}
+	return nil
 }
 
 // validateConfig 校验配置必须是合法的 JSON 对象，并返回独立副本。
@@ -135,6 +157,9 @@ func decodeValue(raw json.RawMessage) (any, error) {
 	dec.UseNumber()
 	var v any
 	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	if err := assertSingleValue(dec); err != nil {
 		return nil, err
 	}
 	return v, nil

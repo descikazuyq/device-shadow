@@ -571,7 +571,9 @@ func (s *Store) SubmitResult(res OperationResult) error {
 	// 不再接收为操作结果，也不校验附带上报或失败原因——直接按截止处理：
 	// 未结束设备全部超时（等待/正在回滚的记回滚超时），活动以失败结束，
 	// 状态时间与活动结束时间采用本次提交时间，返回 ErrCampaignEnded。
-	if !c.Ended && !res.At.Before(c.Deadline) {
+	// 活动可能已被显式推进到截止而结束：applyTimeout 对已结束活动是空操作，
+	// 结果仍按截止拒绝，不能因附带配置非法或缺少原因改成相应的校验错误。
+	if !res.At.Before(c.Deadline) {
 		if err := s.commit(func() error {
 			c.LastTime = res.At
 			s.applyTimeout(c, res.At)
