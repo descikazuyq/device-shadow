@@ -222,6 +222,9 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 			return fmt.Errorf("%w: campaign %s last time before creation", ErrCorruptStorage, id)
 		}
 		seen := map[string]bool{}
+		// expected 收集本活动已接受结果的操作：每个这样的操作都必须在结果
+		// 历史中恰好对应一条记录，键为操作标识。
+		expected := map[string]ResultRecord{}
 		for i, dd := range dc.Devices {
 			if dd.DeviceID == "" || seen[dd.DeviceID] {
 				return fmt.Errorf("%w: campaign %s device list invalid", ErrCorruptStorage, id)
@@ -328,6 +331,31 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 					return err
 				}
 			}
+			// 已接受结果的操作必须能在结果历史中找到对应记录。下载成功等待
+			// 安装、安装失败等待回滚等中间状态同样已有结果；已领取但未完成的
+			// 操作、超时或未执行的阶段没有结果，也不要求历史记录。
+			// 未开启回滚的活动上面已校验回滚操作无结果，这里一并遍历是安全的。
+			for _, e := range []struct {
+				stage string
+				o     diskOp
+			}{
+				{StageDownload, dd.Download},
+				{StageInstall, dd.Install},
+				{StageRollback, dd.Rollback},
+			} {
+				if !e.o.HasResult {
+					continue
+				}
+				expected[e.o.ID] = ResultRecord{
+					DeviceID:    dd.DeviceID,
+					OperationID: e.o.ID,
+					Stage:       e.stage,
+					Success:     e.o.Success,
+					Reason:      e.o.Reason,
+					Version:     e.o.ResultVersion,
+					At:          e.o.At,
+				}
+			}
 			rbOp := decodeOp(dd.Rollback)
 			if !dc.RollbackOnFailure {
 				// 与创建路径一致：内存中始终持有稳定的回滚操作标识。
@@ -374,6 +402,17 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 			if !dr.Success && dr.Reason == "" {
 				return fmt.Errorf("%w: campaign %s failed result without reason", ErrCorruptStorage, id)
 			}
+			// 每条历史记录都必须对应该设备该阶段实际已有的结果；设备、操作
+			// 标识与阶段已由上面的标识校验保证一致，这里比对成败、原因、版本
+			// 与首次接受结果的时间。时间按同一时刻判断，不因时区表示不同而冲突。
+			exp, ok := expected[dr.OperationID]
+			if !ok {
+				return fmt.Errorf("%w: campaign %s result history without accepted result", ErrCorruptStorage, id)
+			}
+			if exp.Success != dr.Success || exp.Reason != dr.Reason ||
+				exp.Version != dr.Version || !exp.At.Equal(dr.At) {
+				return fmt.Errorf("%w: campaign %s result history mismatches accepted result", ErrCorruptStorage, id)
+			}
 			c.Results = append(c.Results, ResultRecord{
 				DeviceID:    dr.DeviceID,
 				OperationID: dr.OperationID,
@@ -383,6 +422,12 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 				Version:     dr.Version,
 				At:          dr.At,
 			})
+		}
+		// 结果历史与已接受的操作结果必须一一对应：上面已保证每条记录
+		// 不重复且对应一个已接受结果，数量相等即每个已接受结果都恰好
+		// 有一条记录；缺少记录同样视为损坏，拒绝打开整个存储。
+		if len(dc.Results) != len(expected) {
+			return fmt.Errorf("%w: campaign %s accepted result missing from result history", ErrCorruptStorage, id)
 		}
 		out[id] = c
 	}
