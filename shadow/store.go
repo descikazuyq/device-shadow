@@ -503,10 +503,17 @@ func (s *Store) restore(data []byte) error {
 		for p, t := range ds.DiffSince {
 			d.DiffSince[p] = t
 		}
-		var lastRev uint64
-		for _, da := range ds.Audit {
-			if da.Operator == "" || da.Time.IsZero() || da.Revision == 0 || da.Revision <= lastRev {
+		// 审计必须完整解释当前期望配置：修订号从 1 开始逐条连续到当前
+		// 期望修订号；首条修改前为登记时的空对象，每条修改后等于下一条
+		// 修改前，末条修改后等于当前期望配置。配置按 JSON 语义比较，
+		// 前后相等的记录同样是合法的一步，不要求操作时间递增。
+		prevAfter := json.RawMessage(`{}`)
+		for i, da := range ds.Audit {
+			if da.Operator == "" || da.Time.IsZero() {
 				return fmt.Errorf("%w: device %s audit invalid", ErrCorruptStorage, id)
+			}
+			if da.Revision != uint64(i)+1 {
+				return fmt.Errorf("%w: device %s audit revision not contiguous", ErrCorruptStorage, id)
 			}
 			if _, ok := decodeObject(da.Before); !ok {
 				return fmt.Errorf("%w: device %s audit invalid", ErrCorruptStorage, id)
@@ -514,7 +521,10 @@ func (s *Store) restore(data []byte) error {
 			if _, ok := decodeObject(da.After); !ok {
 				return fmt.Errorf("%w: device %s audit invalid", ErrCorruptStorage, id)
 			}
-			lastRev = da.Revision
+			if !rawEqual(da.Before, prevAfter) {
+				return fmt.Errorf("%w: device %s audit chain broken", ErrCorruptStorage, id)
+			}
+			prevAfter = da.After
 			d.Audit = append(d.Audit, AuditRecord{
 				DeviceID:  id,
 				Operator:  da.Operator,
@@ -524,6 +534,12 @@ func (s *Store) restore(data []byte) error {
 				Before:    cloneRaw(da.Before),
 				After:     cloneRaw(da.After),
 			})
+		}
+		if ds.Revision != uint64(len(ds.Audit)) {
+			return fmt.Errorf("%w: device %s audit does not reach current revision", ErrCorruptStorage, id)
+		}
+		if !rawEqual(prevAfter, ds.Desired) {
+			return fmt.Errorf("%w: device %s desired config not explained by audit", ErrCorruptStorage, id)
 		}
 		devices[id] = d
 	}
