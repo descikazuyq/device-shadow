@@ -503,9 +503,8 @@ func (s *Store) restore(data []byte) error {
 		for p, t := range ds.DiffSince {
 			d.DiffSince[p] = t
 		}
-		var lastRev uint64
 		for _, da := range ds.Audit {
-			if da.Operator == "" || da.Time.IsZero() || da.Revision == 0 || da.Revision <= lastRev {
+			if da.Operator == "" || da.Time.IsZero() || da.Revision == 0 {
 				return fmt.Errorf("%w: device %s audit invalid", ErrCorruptStorage, id)
 			}
 			if _, ok := decodeObject(da.Before); !ok {
@@ -514,7 +513,6 @@ func (s *Store) restore(data []byte) error {
 			if _, ok := decodeObject(da.After); !ok {
 				return fmt.Errorf("%w: device %s audit invalid", ErrCorruptStorage, id)
 			}
-			lastRev = da.Revision
 			d.Audit = append(d.Audit, AuditRecord{
 				DeviceID:  id,
 				Operator:  da.Operator,
@@ -524,6 +522,30 @@ func (s *Store) restore(data []byte) error {
 				Before:    cloneRaw(da.Before),
 				After:     cloneRaw(da.After),
 			})
+		}
+		// 审计必须能完整解释当前期望配置：修订号从 1 开始逐条连续到当前
+		// 修订号；首条修改前是登记时的空对象，每条修改后等于下一条修改前，
+		// 末条修改后等于当前期望配置。比较沿用配置的 JSON 语义，不要求
+		// 操作时间严格递增。修订号为 0 时审计必须为空、期望必须为空对象。
+		if uint64(len(d.Audit)) != d.Revision {
+			return fmt.Errorf("%w: device %s audit history does not cover revision %d",
+				ErrCorruptStorage, id, d.Revision)
+		}
+		expected := json.RawMessage(`{}`)
+		for i, rec := range d.Audit {
+			if rec.Revision != uint64(i+1) {
+				return fmt.Errorf("%w: device %s audit revision %d out of sequence",
+					ErrCorruptStorage, id, rec.Revision)
+			}
+			if !rawEqual(rec.Before, expected) {
+				return fmt.Errorf("%w: device %s audit revision %d broken chain",
+					ErrCorruptStorage, id, rec.Revision)
+			}
+			expected = rec.After
+		}
+		if !rawEqual(expected, d.Desired) {
+			return fmt.Errorf("%w: device %s desired config not explained by audit",
+				ErrCorruptStorage, id)
 		}
 		devices[id] = d
 	}
