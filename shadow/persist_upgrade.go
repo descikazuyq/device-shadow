@@ -170,6 +170,13 @@ func (s *Store) restoreVersions(disk map[string]diskVersion) error {
 	return nil
 }
 
+// expectedHist 是从已保存操作结果推导出的应有历史条目。
+type expectedHist struct {
+	deviceID string
+	stage    string
+	op       diskOp
+}
+
 // restoreCampaigns 恢复活动并做一致性校验。版本、设备引用、操作标识、
 // 结果历史都必须自洽，否则整个存储拒绝打开。
 func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
@@ -222,6 +229,9 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 			return fmt.Errorf("%w: campaign %s last time before creation", ErrCorruptStorage, id)
 		}
 		seen := map[string]bool{}
+		// expected 按操作标识收集每个已有结果（HasResult）的下载/安装/回滚
+		// 操作所对应的唯一应有历史条目，随后与保存的结果历史逐条对账。
+		expected := map[string]expectedHist{}
 		for i, dd := range dc.Devices {
 			if dd.DeviceID == "" || seen[dd.DeviceID] {
 				return fmt.Errorf("%w: campaign %s device list invalid", ErrCorruptStorage, id)
@@ -347,12 +357,32 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 			}
 			c.index[cd.DeviceID] = len(c.Devices)
 			c.Devices = append(c.Devices, cd)
+			// 每个已有结果的操作都应当恰好对应一条结果历史；
+			// 已领取未完成、超时或因前批失败而未执行的阶段没有结果，不入账。
+			addExpected := func(o diskOp, stage string) {
+				if !o.HasResult {
+					return
+				}
+				expected[o.ID] = expectedHist{deviceID: dd.DeviceID, stage: stage, op: o}
+			}
+			addExpected(dd.Download, StageDownload)
+			addExpected(dd.Install, StageInstall)
+			if dc.RollbackOnFailure {
+				addExpected(dd.Rollback, StageRollback)
+			}
 		}
-		seenResult := map[string]bool{}
-		for _, dr := range dc.Results {
+		// seenHistory 记录已经与保存历史对过账的操作标识。
+		seenHistory := map[string]bool{}
+		var prevAt time.Time
+		for i, dr := range dc.Results {
 			if dr.At.IsZero() {
 				return fmt.Errorf("%w: campaign %s result without time", ErrCorruptStorage, id)
 			}
+			// 历史按接受顺序保存：时间不得倒退；同一时刻按保存次序排列。
+			if i > 0 && dr.At.Before(prevAt) {
+				return fmt.Errorf("%w: campaign %s result history out of order", ErrCorruptStorage, id)
+			}
+			prevAt = dr.At
 			if _, ok := c.index[dr.DeviceID]; !ok {
 				return fmt.Errorf("%w: campaign %s result device mismatch", ErrCorruptStorage, id)
 			}
@@ -366,13 +396,43 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 			if dr.OperationID != wantOp {
 				return fmt.Errorf("%w: campaign %s result op id mismatch", ErrCorruptStorage, id)
 			}
-			key := dr.OperationID
-			if seenResult[key] {
+			if seenHistory[dr.OperationID] {
 				return fmt.Errorf("%w: campaign %s duplicated result history", ErrCorruptStorage, id)
 			}
-			seenResult[key] = true
+			seenHistory[dr.OperationID] = true
+			// 历史必须对应该设备该阶段实际已有的结果：多出记录、设备或阶段不符
+			// 都按损坏处理，不能通过删历史或补结果把矛盾隐藏起来。
+			want, ok := expected[dr.OperationID]
+			if !ok {
+				return fmt.Errorf("%w: campaign %s result history without operation result", ErrCorruptStorage, id)
+			}
+			if want.deviceID != dr.DeviceID || want.stage != dr.Stage {
+				return fmt.Errorf("%w: campaign %s result history stage mismatch", ErrCorruptStorage, id)
+			}
 			if !dr.Success && dr.Reason == "" {
 				return fmt.Errorf("%w: campaign %s failed result without reason", ErrCorruptStorage, id)
+			}
+			o := want.op
+			if o.Success != dr.Success {
+				return fmt.Errorf("%w: campaign %s result history success mismatch", ErrCorruptStorage, id)
+			}
+			// 失败原因必须一致。成功结果的原因不进入历史（提交路径亦不拒绝
+			// 成功结果附带原因），故只对失败结果比对原因。
+			if !o.Success && o.Reason != dr.Reason {
+				return fmt.Errorf("%w: campaign %s result history reason mismatch", ErrCorruptStorage, id)
+			}
+			// 时间按同一时刻判断，不因时区表示不同而冲突。
+			if !o.At.Equal(dr.At) {
+				return fmt.Errorf("%w: campaign %s result history time mismatch", ErrCorruptStorage, id)
+			}
+			// 安装或回滚成功时记录的版本必须与当次操作接受的版本一致。
+			if dr.Success && (dr.Stage == StageInstall || dr.Stage == StageRollback) {
+				if dr.Version != o.ResultVersion || dr.Version == "" {
+					return fmt.Errorf("%w: campaign %s result history version mismatch", ErrCorruptStorage, id)
+				}
+			} else if dr.Version != "" {
+				// 下载成功及任何失败结果都不携带版本。
+				return fmt.Errorf("%w: campaign %s result history with unexpected version", ErrCorruptStorage, id)
 			}
 			c.Results = append(c.Results, ResultRecord{
 				DeviceID:    dr.DeviceID,
@@ -383,6 +443,13 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 				Version:     dr.Version,
 				At:          dr.At,
 			})
+		}
+		// 反向对账：每个已有结果的操作都必须恰好有一条历史；缺少记录即损坏。
+		for opID, want := range expected {
+			if !seenHistory[opID] {
+				return fmt.Errorf("%w: campaign %s device %s %s result missing history",
+					ErrCorruptStorage, id, want.deviceID, want.stage)
+			}
 		}
 		out[id] = c
 	}
