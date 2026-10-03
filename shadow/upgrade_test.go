@@ -666,6 +666,193 @@ func TestDeadlineOnResultAndClaim(t *testing.T) {
 	}
 }
 
+// 已领取安装后普通上报推高了序号；截止时刻提交的成功结果附带序号已旧。
+// 结果已迟到：不应因附带上报不合规返回 ErrInvalidReport 让活动继续等待，
+// 而应返回 ErrCampaignEnded 并让活动按截止超时失败结束。
+func TestDeadlineLateResultWithStaleReport(t *testing.T) {
+	s := setupUpgrade(t, "d1", "d2")
+	spec := upSpec()
+	spec.Devices = []string{"d1", "d2"}
+	spec.BatchSize = 1
+	createCampaign(t, s, spec)
+	bringOnline(t, s, "d1")
+	bringOnline(t, s, "d2")
+
+	// d1 完成下载并领取安装。
+	dl, err := s.Claim(spec.ID, "d1", upBase.Add(5*time.Minute))
+	if err != nil || dl == nil {
+		t.Fatalf("claim download: %v", err)
+	}
+	if err := s.SubmitResult(OperationResult{
+		CampaignID: spec.ID, DeviceID: "d1", OperationID: dl.ID,
+		At: upBase.Add(6 * time.Minute), Success: true,
+	}); err != nil {
+		t.Fatalf("download result: %v", err)
+	}
+	in, err := s.Claim(spec.ID, "d1", upBase.Add(7*time.Minute))
+	if err != nil || in == nil || in.Kind != StageInstall {
+		t.Fatalf("claim install: %v %+v", err, in)
+	}
+	// 领取后普通上报把序号推高到 10（版本仍为 v1）。
+	if err := s.Report("d1", 10, upBase.Add(30*time.Minute), "v1", json.RawMessage(`{"a":1}`)); err != nil {
+		t.Fatalf("plain report: %v", err)
+	}
+	// 截止前：附带序号过旧的成功结果仍按现有校验拒绝，且不改变状态。
+	if err := s.SubmitResult(OperationResult{
+		CampaignID: spec.ID, DeviceID: "d1", OperationID: in.ID,
+		At: upBase.Add(40 * time.Minute), Success: true,
+		Seq: 2, Version: "v2", Config: json.RawMessage(`{}`),
+	}); !errors.Is(err, ErrInvalidReport) {
+		t.Fatalf("stale report before deadline: %v", err)
+	}
+	if v, _ := s.GetCampaign(spec.ID); v.Ended || deviceStatus(v, "d1") != DeviceInstalling {
+		t.Fatalf("invalid report changed state: %+v", v)
+	}
+
+	// 截止时刻：同样的迟到结果触发整体超时，而不是 ErrInvalidReport。
+	lateAt := upBase.Add(2 * time.Hour)
+	if err := s.SubmitResult(OperationResult{
+		CampaignID: spec.ID, DeviceID: "d1", OperationID: in.ID,
+		At: lateAt, Success: true,
+		Seq: 2, Version: "v2", Config: json.RawMessage(`{}`),
+	}); !errors.Is(err, ErrCampaignEnded) {
+		t.Fatalf("late result at deadline: %v", err)
+	}
+	v, _ := s.GetCampaign(spec.ID)
+	if !v.Ended || v.Status != CampaignFailed || !v.EndedAt.Equal(lateAt) {
+		t.Fatalf("campaign ended failed at submission time: %+v", v)
+	}
+	d1 := findDevice(v, "d1")
+	if d1.Status != DeviceTimeout || d1.Phase != StageInstall || d1.Reason == "" || !d1.At.Equal(lateAt) {
+		t.Fatalf("d1 install-phase timeout: %+v", d1)
+	}
+	d2 := findDevice(v, "d2")
+	if d2.Status != DeviceTimeout || d2.Phase != StageDownload || !d2.At.Equal(lateAt) {
+		t.Fatalf("d2 download-phase timeout: %+v", d2)
+	}
+	// 迟到结果不进入历史：只有下载成功一条记录。
+	if len(v.Results) != 1 || v.Results[0].Stage != StageDownload {
+		t.Fatalf("late result added history: %+v", v.Results)
+	}
+	// 影子不被迟到结果改写：版本、序号、上报配置保持普通上报后的值。
+	if sh, _ := s.Get("d1"); sh.Version != "v1" || sh.LastSeq != 10 || string(sh.Reported) != `{"a":1}` {
+		t.Fatalf("shadow changed by late result: %+v", sh)
+	}
+	// 结束后待办不再返回此活动的操作，领取按结束规则拒绝。
+	if w, _ := s.GetDeviceWork("d1"); w.CampaignID != "" || w.Pending != nil {
+		t.Fatalf("pending work after end: %+v", w)
+	}
+	if _, err := s.Claim(spec.ID, "d1", lateAt.Add(time.Minute)); !errors.Is(err, ErrCampaignEnded) {
+		t.Fatalf("claim after deadline end: %v", err)
+	}
+}
+
+// 无效提交（未知操作、未领取阶段、缺失时间、时间倒退）即使越过截止时间，
+// 也按原错误拒绝，不能借此结束活动；已领取操作的迟到失败结果缺少原因
+// 也不挡住截止处理。
+func TestDeadlineLateResultInvalidSubmissions(t *testing.T) {
+	s := setupUpgrade(t, "d1")
+	spec := upSpec()
+	spec.Devices = []string{"d1"}
+	spec.BatchSize = 1
+	createCampaign(t, s, spec)
+	bringOnline(t, s, "d1")
+	dl, err := s.Claim(spec.ID, "d1", upBase.Add(5*time.Minute))
+	if err != nil || dl == nil {
+		t.Fatalf("claim download: %v", err)
+	}
+	lateAt := upBase.Add(2 * time.Hour)
+	inID := spec.ID + ":d1:" + StageInstall
+
+	// 未知操作标识。
+	if err := s.SubmitResult(OperationResult{
+		CampaignID: spec.ID, DeviceID: "d1", OperationID: spec.ID + ":d1:bogus",
+		At: lateAt, Success: true,
+	}); !errors.Is(err, ErrOperationNotFound) {
+		t.Fatalf("unknown op at deadline: %v", err)
+	}
+	// 未领取的阶段。
+	if err := s.SubmitResult(OperationResult{
+		CampaignID: spec.ID, DeviceID: "d1", OperationID: inID,
+		At: lateAt, Success: true, Seq: 2, Version: "v2", Config: json.RawMessage(`{}`),
+	}); !errors.Is(err, ErrOperationNotClaimed) {
+		t.Fatalf("unclaimed op at deadline: %v", err)
+	}
+	// 缺失时间。
+	if err := s.SubmitResult(OperationResult{
+		CampaignID: spec.ID, DeviceID: "d1", OperationID: dl.ID, Success: true,
+	}); !errors.Is(err, ErrInvalidTime) {
+		t.Fatalf("missing time: %v", err)
+	}
+	// 时间倒退。
+	if err := s.SubmitResult(OperationResult{
+		CampaignID: spec.ID, DeviceID: "d1", OperationID: dl.ID,
+		At: upBase.Add(4 * time.Minute), Success: true,
+	}); !errors.Is(err, ErrTimeRegression) {
+		t.Fatalf("time regression: %v", err)
+	}
+	if v, _ := s.GetCampaign(spec.ID); v.Ended {
+		t.Fatalf("invalid submissions ended campaign: %+v", v)
+	}
+
+	// 已领取下载在截止时刻提交失败结果且缺少原因：仍按截止超时处理。
+	if err := s.SubmitResult(OperationResult{
+		CampaignID: spec.ID, DeviceID: "d1", OperationID: dl.ID,
+		At: lateAt, Success: false,
+	}); !errors.Is(err, ErrCampaignEnded) {
+		t.Fatalf("late failure without reason: %v", err)
+	}
+	v, _ := s.GetCampaign(spec.ID)
+	if !v.Ended || v.Status != CampaignFailed || deviceStatus(v, "d1") != DeviceTimeout {
+		t.Fatalf("late failure without reason ends campaign: %+v", v)
+	}
+	if len(v.Results) != 0 {
+		t.Fatalf("late failure added history: %+v", v.Results)
+	}
+}
+
+// 已接受结果的重复提交即使越过截止时间仍成功，不额外触发超时或增加历史；
+// 改成不同结果仍返回冲突。
+func TestAcceptedResultReplayPastDeadline(t *testing.T) {
+	s := setupUpgrade(t, "d1", "d2")
+	spec := upSpec()
+	spec.Devices = []string{"d1", "d2"}
+	spec.BatchSize = 1
+	createCampaign(t, s, spec)
+	bringOnline(t, s, "d1")
+	bringOnline(t, s, "d2")
+	// d1 完整成功，d2 尚未开始，活动仍在运行。
+	finishDevice(t, s, spec, "d1", upBase.Add(5*time.Minute))
+	v, _ := s.GetCampaign(spec.ID)
+	if v.Ended {
+		t.Fatalf("campaign should still run: %+v", v)
+	}
+	n := len(v.Results)
+	d1 := findDevice(v, "d1")
+	// 越过截止时间的相同结果重复提交：成功，不触发超时、不增加历史。
+	if err := s.SubmitResult(OperationResult{
+		CampaignID: spec.ID, DeviceID: "d1", OperationID: d1.InstallID,
+		At: upBase.Add(3 * time.Hour), Success: true,
+		Seq: 2, Version: "v2", Config: json.RawMessage(`{"ok":true}`),
+	}); err != nil {
+		t.Fatalf("replay past deadline: %v", err)
+	}
+	v, _ = s.GetCampaign(spec.ID)
+	if v.Ended || len(v.Results) != n {
+		t.Fatalf("replay past deadline changed campaign: %+v", v)
+	}
+	// 不同结果仍冲突，活动保持运行。
+	if err := s.SubmitResult(OperationResult{
+		CampaignID: spec.ID, DeviceID: "d1", OperationID: d1.InstallID,
+		At: upBase.Add(3 * time.Hour), Success: false, Reason: "changed",
+	}); !errors.Is(err, ErrResultConflict) {
+		t.Fatalf("conflicting replay past deadline: %v", err)
+	}
+	if v, _ := s.GetCampaign(spec.ID); v.Ended {
+		t.Fatalf("conflict past deadline ended campaign: %+v", v)
+	}
+}
+
 func findDevice(v CampaignView, id string) DeviceStatusView {
 	for _, d := range v.Devices {
 		if d.DeviceID == id {

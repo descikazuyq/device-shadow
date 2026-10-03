@@ -567,6 +567,53 @@ func TestRollbackDeadlineTimeout(t *testing.T) {
 	}
 }
 
+// 已领取回滚后普通上报推高了序号；截止时刻提交的回滚成功结果附带序号已旧。
+// 结果已迟到：不按 ErrInvalidReport 拒绝，而是让活动按回滚阶段超时失败结束，
+// 且影子不被迟到结果改写（版本不得被改为锁定目标之外的值，序号等保持）。
+func TestRollbackDeadlineLateResultWithStaleReport(t *testing.T) {
+	s := setupUpgrade(t, "d1")
+	spec := rbSpec()
+	createCampaign(t, s, spec)
+	bringOnline(t, s, "d1")
+	awaitRollback(t, s, spec, "d1", upBase.Add(2*time.Minute))
+	rb, err := s.Claim(spec.ID, "d1", upBase.Add(8*time.Minute))
+	if err != nil || rb == nil || rb.Kind != StageRollback {
+		t.Fatalf("claim rollback: %v %+v", err, rb)
+	}
+	// 领取回滚后普通上报把序号推高到 10。
+	if err := s.Report("d1", 10, upBase.Add(30*time.Minute), "v1", json.RawMessage(`{"a":1}`)); err != nil {
+		t.Fatalf("plain report: %v", err)
+	}
+	// 截止时刻：附带序号过旧的回滚成功结果触发回滚阶段超时。
+	lateAt := upBase.Add(2 * time.Hour)
+	if err := s.SubmitResult(OperationResult{
+		CampaignID: spec.ID, DeviceID: "d1", OperationID: rb.ID,
+		At: lateAt, Success: true,
+		Seq: 2, Version: "v1", Config: json.RawMessage(`{}`),
+	}); !errors.Is(err, ErrCampaignEnded) {
+		t.Fatalf("late rollback result at deadline: %v", err)
+	}
+	v, _ := s.GetCampaign(spec.ID)
+	if !v.Ended || v.Status != CampaignFailed || !v.EndedAt.Equal(lateAt) {
+		t.Fatalf("campaign ended failed at submission time: %+v", v)
+	}
+	d := findDevice(v, "d1")
+	if d.Status != DeviceRollbackTimeout || d.Phase != StageRollback || d.Reason == "" || !d.At.Equal(lateAt) {
+		t.Fatalf("rollback-phase timeout: %+v", d)
+	}
+	if d.RollbackResult {
+		t.Fatalf("late rollback result accepted: %+v", d)
+	}
+	// 历史只有下载成功与安装失败两条；迟到结果不增加历史。
+	if len(v.Results) != 2 || v.Results[1].Stage != StageInstall || v.Results[1].Success {
+		t.Fatalf("late result added history: %+v", v.Results)
+	}
+	// 影子保持普通上报后的状态：版本 v1、序号 10、上报配置不变。
+	if sh, _ := s.Get("d1"); sh.Version != "v1" || sh.LastSeq != 10 || string(sh.Reported) != `{"a":1}` {
+		t.Fatalf("shadow changed by late rollback result: %+v", sh)
+	}
+}
+
 // 回滚未完成时的普通上报只更新影子，不替代回滚结果或清除待办；
 // 回滚最终仍必须恢复到锁定版本。
 func TestPlainReportDuringRollbackOnlyUpdatesShadow(t *testing.T) {

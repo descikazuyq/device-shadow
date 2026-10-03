@@ -523,6 +523,12 @@ func (s *Store) batchOpen(c *campaignState, cd *campaignDevice) bool {
 // 开启回滚的活动中，安装失败不直接结束设备，而是保留原失败原因与时间、
 // 令设备等待回滚；回滚失败必须给出原因，设备以回滚失败结束且影子不变。
 // 普通设备上报不经过本方法，也不会推进活动。
+// 已领取且尚未接受结果的操作，提交时间达到截止时间时结果不再接收：
+// 返回 ErrCampaignEnded，活动以失败结束，未结束设备按所处阶段记为超时
+// （等待或正在回滚的记为回滚阶段超时），状态时间与活动结束时间采用本次
+// 提交时间；迟到结果不进入结果历史、不更新影子，也不要求附带上报合规或
+// 失败原因齐全。未知操作、未领取阶段、缺失时间或时间倒退仍按原错误拒绝，
+// 不会触发超时。
 func (s *Store) SubmitResult(res OperationResult) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -564,6 +570,20 @@ func (s *Store) SubmitResult(res OperationResult) error {
 		// 标识是本设备未来阶段的操作但尚未领取：属于跳过阶段（含未领取的回滚）。
 		return fmt.Errorf("%w: %s", ErrOperationNotClaimed, res.OperationID)
 	}
+	// 已领取且尚未接受结果的操作，提交时间达到截止时间：结果不再接收，
+	// 活动以失败结束，未结束设备全部超时并落盘。迟到结果不再要求附带上报
+	// 合规或失败原因齐全——它已迟到，不应因附带内容不合规让活动继续等待。
+	if !res.At.Before(c.Deadline) {
+		err = s.commit(func() error {
+			c.LastTime = res.At
+			s.applyTimeout(c, res.At)
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		return ErrCampaignEnded
+	}
 	if !res.Success && res.Reason == "" {
 		return ErrInvalidReason
 	}
@@ -579,14 +599,7 @@ func (s *Store) SubmitResult(res OperationResult) error {
 	}
 	var reject error
 	err = s.commit(func() error {
-		// 到达截止时间：未结束设备全部超时并落盘；新结果（非重复）不再接受。
-		// 未完成回滚的设备在这一时刻记为回滚阶段超时（见 applyTimeout）。
-		if !res.At.Before(c.Deadline) {
-			c.LastTime = res.At
-			s.applyTimeout(c, res.At)
-			reject = ErrCampaignEnded
-			return nil
-		}
+		// 截止时间的超时已在提交前处理；此处只可能发生在截止之前。
 		if c.Ended {
 			// 活动结束后的新结果：拒绝且不改状态（重复结果已在提交前处理）。
 			reject = ErrCampaignEnded
