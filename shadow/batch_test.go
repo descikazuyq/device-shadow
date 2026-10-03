@@ -1,6 +1,7 @@
 package shadow
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -636,5 +637,216 @@ func TestBatchClosedStore(t *testing.T) {
 	}
 	if _, err := s.GetBatchRequest("req-1"); !errors.Is(err, ErrClosed) {
 		t.Fatalf("query on closed store: %v", err)
+	}
+}
+
+// batchStoreDir 创建一台设备的成功批量请求（req-1，dev-1，修订号 0->1，
+// 配置 {"a":1}）并关闭存储，返回目录，供篡改后重开。
+func batchStoreDir(t *testing.T) string {
+	t.Helper()
+	s, dir := openTemp(t)
+	mustRegister(t, s, "dev-1", "1.0")
+	mustBatch(t, s, "req-1", "alice", base, []BatchDevice{
+		{DeviceID: "dev-1", Revision: 0, Config: json.RawMessage(`{"a":1}`)},
+	})
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func rewriteStore(t *testing.T, dir string, mutate func(map[string]any)) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, storeFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatal(err)
+	}
+	mutate(doc)
+	out, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, storeFileName), out, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func firstAudit(doc map[string]any) map[string]any {
+	return doc["devices"].(map[string]any)["dev-1"].(map[string]any)["audit"].([]any)[0].(map[string]any)
+}
+
+func firstBatchDev(doc map[string]any) map[string]any {
+	return doc["batches"].(map[string]any)["req-1"].(map[string]any)["devices"].([]any)[0].(map[string]any)
+}
+
+// 审计被改成其他操作者/时间/配置后，即使请求标识与修订号对得上也必须拒绝。
+func TestBatchRestoreTamperedAuditRefused(t *testing.T) {
+	// 操作者被改
+	dir := batchStoreDir(t)
+	rewriteStore(t, dir, func(doc map[string]any) {
+		firstAudit(doc)["operator"] = "mallory"
+	})
+	if _, err := Open(dir); !errors.Is(err, ErrCorruptStorage) {
+		t.Fatalf("tampered audit operator: %v", err)
+	}
+
+	// 发生时间被改为另一时刻（仍非零值）
+	dir = batchStoreDir(t)
+	rewriteStore(t, dir, func(doc map[string]any) {
+		firstAudit(doc)["time"] = "2026-10-02T12:05:00Z"
+	})
+	if _, err := Open(dir); !errors.Is(err, ErrCorruptStorage) {
+		t.Fatalf("tampered audit time: %v", err)
+	}
+
+	// 修改后配置值不同：{"a":2}
+	dir = batchStoreDir(t)
+	rewriteStore(t, dir, func(doc map[string]any) {
+		firstAudit(doc)["after"] = map[string]any{"a": 2}
+	})
+	if _, err := Open(dir); !errors.Is(err, ErrCorruptStorage) {
+		t.Fatalf("tampered audit after config: %v", err)
+	}
+
+	// 审计误挂到另一个存在、但实际未包含该设备的请求：构造 req-2（仅
+	// dev-2）；dev-1 后续的单台审计（请求标识本应为空）被改成 req-2。
+	// 此时 req-1 的正向核对仍通过，只有反向核对能发现误挂。
+	s, dir2 := openTemp(t)
+	mustRegister(t, s, "dev-1", "1.0")
+	mustRegister(t, s, "dev-2", "1.0")
+	mustBatch(t, s, "req-1", "alice", base, []BatchDevice{
+		{DeviceID: "dev-1", Revision: 0, Config: json.RawMessage(`{"a":1}`)},
+	})
+	if _, err := s.UpdateDesired("dev-1", "bob", base.Add(30*time.Minute), 1, json.RawMessage(`{"a":8}`)); err != nil {
+		t.Fatal(err)
+	}
+	mustBatch(t, s, "req-2", "alice", base.Add(time.Hour), []BatchDevice{
+		{DeviceID: "dev-2", Revision: 0, Config: json.RawMessage(`{"b":2}`)},
+	})
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rewriteStore(t, dir2, func(doc map[string]any) {
+		audits := doc["devices"].(map[string]any)["dev-1"].(map[string]any)["audit"].([]any)
+		audits[1].(map[string]any)["requestId"] = "req-2"
+	})
+	if _, err := Open(dir2); !errors.Is(err, ErrCorruptStorage) {
+		t.Fatalf("audit misattached to other existing request: %v", err)
+	}
+
+	// 损坏内容不被覆盖
+	data, _ := os.ReadFile(filepath.Join(dir2, storeFileName))
+	if len(data) == 0 || !bytes.Contains(data, []byte(`"req-2"`)) {
+		t.Fatalf("corrupt file overwritten: %s", data)
+	}
+}
+
+// 双向核对：请求缺审计、审计修订号指向请求未产生的修订号，都必须拒绝。
+func TestBatchRestorePairingRefused(t *testing.T) {
+	// 请求中设备的新修订号改指向设备后来一次单台修改的修订号：
+	// 请求不再有对应的批量审计（缺审计），原批量审计也变成误挂。
+	s, dir := openTemp(t)
+	mustRegister(t, s, "dev-1", "1.0")
+	mustBatch(t, s, "req-1", "alice", base, []BatchDevice{
+		{DeviceID: "dev-1", Revision: 0, Config: json.RawMessage(`{"a":1}`)},
+	})
+	if _, err := s.UpdateDesired("dev-1", "bob", base.Add(time.Hour), 1, json.RawMessage(`{"a":9}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rewriteStore(t, dir, func(doc map[string]any) {
+		bd := firstBatchDev(doc)
+		bd["newRevision"] = 2
+		bd["revision"] = 1
+	})
+	if _, err := Open(dir); !errors.Is(err, ErrCorruptStorage) {
+		t.Fatalf("request without matching audit: %v", err)
+	}
+
+	// 审计修订号被改：请求产生 1，审计指向 2；审计不再描述该请求项
+	dir = batchStoreDir(t)
+	rewriteStore(t, dir, func(doc map[string]any) {
+		firstAudit(doc)["revision"] = 2
+	})
+	if _, err := Open(dir); !errors.Is(err, ErrCorruptStorage) {
+		t.Fatalf("audit revision not produced by request: %v", err)
+	}
+}
+
+// 配置按批量提交的既有语义比较：1 与 1.0 相等、时区不同的同一时刻相等。
+func TestBatchRestoreSemanticEqualityAccepted(t *testing.T) {
+	dir := batchStoreDir(t)
+	rewriteStore(t, dir, func(doc map[string]any) {
+		firstAudit(doc)["after"] = map[string]any{"a": 1.0}
+		firstAudit(doc)["time"] = "2026-10-02T20:00:00+08:00"
+	})
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("numeric/time representation differences must open: %v", err)
+	}
+	defer s.Close()
+	rec, err := s.GetBatchRequest("req-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rec.Time.Equal(base) {
+		t.Fatalf("restored request time: %v", rec.Time)
+	}
+	recs, _ := s.Audit("dev-1")
+	if len(recs) != 1 || !recs[0].Time.Equal(base) || !rawEqual(recs[0].After, json.RawMessage(`{"a":1}`)) {
+		t.Fatalf("restored audit: %+v", recs)
+	}
+}
+
+// 核对的是历史修改：设备后来接受单台修改或其他批量修改后，旧请求仍正常恢复；
+// 查询返回首次结果，原内容重发不覆盖较新配置、不增加审计。
+func TestBatchRestoreHistoryAfterLaterChanges(t *testing.T) {
+	s, dir := openTemp(t)
+	mustRegister(t, s, "dev-1", "1.0")
+	mustBatch(t, s, "req-1", "alice", base, []BatchDevice{
+		{DeviceID: "dev-1", Revision: 0, Config: json.RawMessage(`{"a":1}`)},
+	})
+	// 随后一次单台修改，审计请求标识为空
+	if _, err := s.UpdateDesired("dev-1", "bob", base.Add(time.Hour), 1, json.RawMessage(`{"a":9}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen after later single update: %v", err)
+	}
+	defer s2.Close()
+	got, err := s2.GetBatchRequest("req-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Operator != "alice" || got.Revisions["dev-1"] != 1 {
+		t.Fatalf("historical record changed: %+v", got)
+	}
+	recs, _ := s2.Audit("dev-1")
+	if len(recs) != 2 || recs[0].RequestID != "req-1" || recs[1].RequestID != "" {
+		t.Fatalf("audits after reopen: %+v", recs)
+	}
+	// 原内容重发：返回首次结果，不覆盖较新配置，不增加审计
+	again := mustBatch(t, s2, "req-1", "alice", base, []BatchDevice{
+		{DeviceID: "dev-1", Revision: 0, Config: json.RawMessage(`{"a":1}`)},
+	})
+	if again.Revisions["dev-1"] != 1 {
+		t.Fatalf("stale resubmit result: %+v", again.Revisions)
+	}
+	v, _ := s2.Get("dev-1")
+	if v.Revision != 2 || string(v.Desired) != `{"a":9}` {
+		t.Fatalf("newer config overwritten: %+v", v)
+	}
+	if recs, _ := s2.Audit("dev-1"); len(recs) != 2 {
+		t.Fatalf("audit grew on resubmit: %+v", recs)
 	}
 }
