@@ -3,6 +3,7 @@ package shadow
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"math/big"
 	"reflect"
 	"sort"
@@ -88,14 +89,19 @@ func escapePointer(s string) string {
 }
 
 // decodeObject 把 raw 解析为 JSON 对象；raw 非对象时返回 false。
+// 对象前后只允许 JSON 标准空白（空格、制表符、换行、回车）；
+// 对象结束后的第二个 JSON 值或其他非空白文本都视为非法。
 func decodeObject(raw json.RawMessage) (map[string]json.RawMessage, bool) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return nil, false
 	}
 	var obj map[string]json.RawMessage
-	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	if err := dec.Decode(&obj); err != nil {
+		return nil, false
+	}
+	if dec.More() { // 对象之后还有非空白内容（第二个值或其他文本）
 		return nil, false
 	}
 	if obj == nil { // "null" 已通过首字符排除，这里防御性处理
@@ -130,12 +136,18 @@ func rawEqual(a, b json.RawMessage) bool {
 	return jsonDeepEqual(av, bv)
 }
 
+// errTrailingData 表示 JSON 值之后还有非空白内容，用于内部比较。
+var errTrailingData = errors.New("shadow: trailing data after JSON value")
+
 func decodeValue(raw json.RawMessage) (any, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	var v any
 	if err := dec.Decode(&v); err != nil {
 		return nil, err
+	}
+	if dec.More() { // 值之后还有非空白内容：不参与相等判断
+		return nil, errTrailingData
 	}
 	return v, nil
 }
