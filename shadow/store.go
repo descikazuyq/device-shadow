@@ -203,6 +203,9 @@ func (s *Store) UpdateDesired(deviceID, operator string, at time.Time, revision 
 // Report 处理设备上报。需携带正整数序号、时间、非空当前版本和完整配置。
 // 更大序号更新上报并标为在线；相同序号且版本、配置、时间相同视为重复，
 // 成功返回但不改变状态；相同序号内容不同或更小序号返回错误。
+//
+// 校验、序号判断与影子写入规则与安装/回滚成功的附带上报共用同一实现
+// （checkReport/applyReport），仅错误类别保持各自公开的哨兵不变。
 func (s *Store) Report(deviceID string, seq uint64, at time.Time, version string, config json.RawMessage) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -213,35 +216,17 @@ func (s *Store) Report(deviceID string, seq uint64, at time.Time, version string
 	if err != nil {
 		return err
 	}
-	if seq == 0 {
-		return ErrInvalidSequence
-	}
-	if at.IsZero() {
-		return ErrInvalidTime
-	}
-	if version == "" {
-		return ErrInvalidVersion
-	}
-	cfg, err := validateConfig(config)
+	in := reportInput{DeviceID: deviceID, Seq: seq, At: at, Version: version, Config: config}
+	cfg, verdict, err := checkReport(d, in, "")
 	if err != nil {
-		return err
+		return reportPlainError(err.(errBadReport))
 	}
-	switch {
-	case seq < d.LastSeq:
-		return fmt.Errorf("%w: last accepted %d, got %d", ErrStaleSequence, d.LastSeq, seq)
-	case seq == d.LastSeq:
-		if version == d.Version && at.Equal(d.LastReportTime) && rawEqual(cfg, d.Reported) {
-			return nil // 重复上报：成功返回，不改变状态
-		}
-		return fmt.Errorf("%w: sequence %d", ErrReportConflict, seq)
+	if verdict == reportDuplicate {
+		// 重复上报：成功返回，不写入影子，也不触发持久化。
+		return nil
 	}
 	return s.commit(func() error {
-		d.Reported = cfg
-		d.Version = version
-		d.Online = true
-		d.LastSeq = seq
-		d.LastReportTime = at
-		d.refreshDiff(at)
+		applyReport(d, in, cfg, verdict, at)
 		return nil
 	})
 }
