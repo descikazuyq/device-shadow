@@ -44,8 +44,11 @@ func (s *Store) marshalBatches() map[string]diskBatch {
 }
 
 // restoreBatches 恢复批量请求记录并做一致性校验：标识、操作者、时间、
-// 设备列表、配置、修订号都必须自洽，且每台设备的审计中必须存在带同一
-// 请求标识的对应记录；任何损坏都拒绝打开整个存储。
+// 设备列表、配置、修订号都必须自洽。每台设备在审计中必须有且仅有一条
+// 对应记录：请求标识、新修订号、操作者、时刻（时区表示无关）与修改后
+// 配置（按语义比较）都与请求一致；反过来，审计中带批量请求标识的记录
+// 必须对应该请求实际包含的设备及其新修订号，不能仅因请求存在就接受。
+// 任何损坏都拒绝打开整个存储，不修正、不丢弃、不覆盖原有内容。
 // 旧存储没有批量记录时 disk 为 nil，正常打开。
 func (s *Store) restoreBatches(disk map[string]diskBatch) error {
 	out := make(map[string]*batchRequestState, len(disk))
@@ -76,16 +79,28 @@ func (s *Store) restoreBatches(disk map[string]diskBatch) error {
 			if dd.NewRevision != dd.Revision+1 || dev.Revision < dd.NewRevision {
 				return fmt.Errorf("%w: batch request %s device %s revision mismatch", ErrCorruptStorage, id, dd.DeviceID)
 			}
-			// 设备审计中必须存在带同一请求标识、同一新修订号的记录。
-			found := false
+			// 设备审计中必须有且仅有一条对应记录：请求标识与新修订号
+			// 相同，操作者相同，时间表示同一时刻，修改后配置与请求提交
+			// 的完整配置语义相等（空白、字段顺序、数字写法无关）。
+			match := 0
 			for _, a := range dev.Audit {
-				if a.RequestID == id && a.Revision == dd.NewRevision {
-					found = true
-					break
+				if a.RequestID != id || a.Revision != dd.NewRevision {
+					continue
+				}
+				match++
+				if a.Operator != db.Operator || !a.Time.Equal(db.Time) ||
+					!rawEqual(a.After, dd.Config) {
+					return fmt.Errorf("%w: batch request %s device %s audit content mismatch",
+						ErrCorruptStorage, id, dd.DeviceID)
 				}
 			}
-			if !found {
-				return fmt.Errorf("%w: batch request %s device %s audit missing", ErrCorruptStorage, id, dd.DeviceID)
+			if match == 0 {
+				return fmt.Errorf("%w: batch request %s device %s audit missing",
+					ErrCorruptStorage, id, dd.DeviceID)
+			}
+			if match > 1 {
+				return fmt.Errorf("%w: batch request %s device %s audit duplicated",
+					ErrCorruptStorage, id, dd.DeviceID)
 			}
 			rec.Devices = append(rec.Devices, batchDeviceState{
 				DeviceID:    dd.DeviceID,
@@ -96,15 +111,28 @@ func (s *Store) restoreBatches(disk map[string]diskBatch) error {
 		}
 		out[id] = rec
 	}
-	// 反向校验：审计中的非空请求标识必须对应一条已保存的批量记录
-	// （单设备修改的审计标识为空，无需补填）。
+	// 反向校验：审计中的非空请求标识必须对应一条已保存的批量记录，
+	// 且该请求的设备列表确实包含本设备及此新修订号（单设备修改的
+	// 审计标识为空，无需补填）。内容一致性已由上面的正向校验覆盖。
 	for devID, dev := range s.devices {
 		for _, a := range dev.Audit {
 			if a.RequestID == "" {
 				continue
 			}
-			if _, ok := out[a.RequestID]; !ok {
+			rec, ok := out[a.RequestID]
+			if !ok {
 				return fmt.Errorf("%w: device %s audit references unknown batch request %s",
+					ErrCorruptStorage, devID, a.RequestID)
+			}
+			ok = false
+			for _, d := range rec.Devices {
+				if d.DeviceID == devID && d.NewRevision == a.Revision {
+					ok = true
+					break
+				}
+			}
+			if !ok {
+				return fmt.Errorf("%w: device %s audit does not match batch request %s",
 					ErrCorruptStorage, devID, a.RequestID)
 			}
 		}
