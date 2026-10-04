@@ -154,6 +154,9 @@ func (s *Store) Register(deviceID, version string) error {
 // UpdateDesired 修改设备的期望配置，完整替换旧配置。
 // 需携带操作者、操作时间和已读取的期望修订号；修订号不等于当前值时
 // 返回 ErrRevisionConflict，影子和审计均不改变。成功时返回新修订号。
+//
+// 配置替换、修订号递增、审计与差异首次出现时间更新与批量修改共用同一
+// 实现（applyDesiredChange）；本入口的审计请求标识为空。
 func (s *Store) UpdateDesired(deviceID, operator string, at time.Time, revision uint64, config json.RawMessage) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -179,19 +182,11 @@ func (s *Store) UpdateDesired(deviceID, operator string, at time.Time, revision 
 	}
 	var newRevision uint64
 	err = s.commit(func() error {
-		before := d.Desired
-		d.Desired = cfg
-		d.Revision++
-		newRevision = d.Revision
-		d.Audit = append(d.Audit, AuditRecord{
-			DeviceID: deviceID,
+		newRevision = applyDesiredChange(d, deviceID, desiredChange{
 			Operator: operator,
-			Time:     at,
-			Revision: newRevision,
-			Before:   cloneRaw(before),
-			After:    cloneRaw(cfg),
+			At:       at,
+			Config:   cfg,
 		})
-		d.refreshDiff(at)
 		return nil
 	})
 	if err != nil {

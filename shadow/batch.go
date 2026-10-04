@@ -45,6 +45,10 @@ type batchDeviceState struct {
 // BatchUpdateDesired 用一次请求同时修改多台已登记设备的期望配置，
 // 每台设备完整替换旧配置、修订号各加一并留下带同一请求标识的审计。
 //
+// 每台设备的配置替换、修订号递增、审计与差异首次出现时间更新与单设备
+// 修改共用 applyDesiredChange，保证两种方式交替使用时审计连续、
+// 修改前后配置衔接。
+//
 // 请求标识在当前存储内唯一：相同标识再次提交相同内容（设备次序、JSON
 // 空白与对象字段顺序无关，数字按数值比较，时间按同一时刻判断）直接返回
 // 首次结果，不重复修改；相同标识提交不同内容返回 ErrRequestConflict，
@@ -125,24 +129,18 @@ func (s *Store) BatchUpdateDesired(requestID, operator string, at time.Time, dev
 	rec := &batchRequestState{ID: requestID, Operator: operator, Time: at}
 	err := s.commit(func() error {
 		for _, it := range items {
-			d := it.dev
-			before := d.Desired
-			d.Desired = it.cfg
-			d.Revision++
-			d.Audit = append(d.Audit, AuditRecord{
-				DeviceID:  it.id,
+			// 配置替换、修订号递增、审计与差异时间更新与单设备修改
+			// 共用 applyDesiredChange，请求标识记为本批量标识。
+			newRevision := applyDesiredChange(it.dev, it.id, desiredChange{
 				Operator:  operator,
-				Time:      at,
-				Revision:  d.Revision,
+				At:        at,
+				Config:    it.cfg,
 				RequestID: requestID,
-				Before:    cloneRaw(before),
-				After:     cloneRaw(it.cfg),
 			})
-			d.refreshDiff(at)
 			rec.Devices = append(rec.Devices, batchDeviceState{
 				DeviceID:    it.id,
 				Revision:    it.rev,
-				NewRevision: d.Revision,
+				NewRevision: newRevision,
 				Config:      cloneRaw(it.cfg),
 			})
 		}
