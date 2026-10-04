@@ -154,6 +154,10 @@ func (s *Store) Register(deviceID, version string) error {
 // UpdateDesired 修改设备的期望配置，完整替换旧配置。
 // 需携带操作者、操作时间和已读取的期望修订号；修订号不等于当前值时
 // 返回 ErrRevisionConflict，影子和审计均不改变。成功时返回新修订号。
+//
+// 配置校验、修订号判断、配置替换、审计与差异时间更新与批量修改共用同一
+// 实现（checkDesiredMeta/checkDesiredRevision/applyDesired），仅校验次序
+// 与错误消息格式保持各自既有形式。
 func (s *Store) UpdateDesired(deviceID, operator string, at time.Time, revision uint64, config json.RawMessage) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -164,34 +168,19 @@ func (s *Store) UpdateDesired(deviceID, operator string, at time.Time, revision 
 	if err != nil {
 		return 0, err
 	}
-	if operator == "" {
-		return 0, ErrInvalidOperator
-	}
-	if at.IsZero() {
-		return 0, ErrInvalidTime
+	if err := checkDesiredMeta(operator, at); err != nil {
+		return 0, err
 	}
 	cfg, err := validateConfig(config)
 	if err != nil {
 		return 0, err
 	}
-	if revision != d.Revision {
-		return 0, fmt.Errorf("%w: want %d, got %d", ErrRevisionConflict, d.Revision, revision)
+	if err := checkDesiredRevision(d, deviceID, revision); err != nil {
+		return 0, desiredSingleError(err.(errDesiredRevision))
 	}
 	var newRevision uint64
 	err = s.commit(func() error {
-		before := d.Desired
-		d.Desired = cfg
-		d.Revision++
-		newRevision = d.Revision
-		d.Audit = append(d.Audit, AuditRecord{
-			DeviceID: deviceID,
-			Operator: operator,
-			Time:     at,
-			Revision: newRevision,
-			Before:   cloneRaw(before),
-			After:    cloneRaw(cfg),
-		})
-		d.refreshDiff(at)
+		newRevision = applyDesired(d, deviceID, operator, at, "", cfg)
 		return nil
 	})
 	if err != nil {

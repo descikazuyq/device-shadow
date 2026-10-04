@@ -54,6 +54,10 @@ type batchDeviceState struct {
 // ErrDeviceNotFound。新标识下任一设备校验失败（列表为空、标识为空或
 // 重复、设备未登记、配置非法、修订号冲突）时整批报错，所有设备状态、
 // 审计均不变，也不占用请求标识。离线设备同样接受修改。
+//
+// 每台设备的配置校验、修订号判断、配置替换、审计与差异时间更新与单台
+// 修改共用同一实现（checkDesiredMeta/checkDesiredRevision/applyDesired），
+// 仅校验次序与错误消息格式保持各自既有形式。
 func (s *Store) BatchUpdateDesired(requestID, operator string, at time.Time, devices []BatchDevice) (BatchRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -63,11 +67,8 @@ func (s *Store) BatchUpdateDesired(requestID, operator string, at time.Time, dev
 	if requestID == "" {
 		return BatchRecord{}, ErrInvalidRequestID
 	}
-	if operator == "" {
-		return BatchRecord{}, ErrInvalidOperator
-	}
-	if at.IsZero() {
-		return BatchRecord{}, ErrInvalidTime
+	if err := checkDesiredMeta(operator, at); err != nil {
+		return BatchRecord{}, err
 	}
 	if len(devices) == 0 {
 		return BatchRecord{}, ErrInvalidDeviceList
@@ -117,32 +118,19 @@ func (s *Store) BatchUpdateDesired(requestID, operator string, at time.Time, dev
 	}
 	// 修订号冲突检查在任何修改之前完成，失败整批不变。
 	for _, it := range items {
-		if it.rev != it.dev.Revision {
-			return BatchRecord{}, fmt.Errorf("%w: device %s want %d, got %d",
-				ErrRevisionConflict, it.id, it.dev.Revision, it.rev)
+		if err := checkDesiredRevision(it.dev, it.id, it.rev); err != nil {
+			return BatchRecord{}, desiredBatchError(err.(errDesiredRevision))
 		}
 	}
 	rec := &batchRequestState{ID: requestID, Operator: operator, Time: at}
 	err := s.commit(func() error {
 		for _, it := range items {
-			d := it.dev
-			before := d.Desired
-			d.Desired = it.cfg
-			d.Revision++
-			d.Audit = append(d.Audit, AuditRecord{
-				DeviceID:  it.id,
-				Operator:  operator,
-				Time:      at,
-				Revision:  d.Revision,
-				RequestID: requestID,
-				Before:    cloneRaw(before),
-				After:     cloneRaw(it.cfg),
-			})
-			d.refreshDiff(at)
+			// 与单台修改共用同一写入规则，审计携带本批次的请求标识。
+			newRevision := applyDesired(it.dev, it.id, operator, at, requestID, it.cfg)
 			rec.Devices = append(rec.Devices, batchDeviceState{
 				DeviceID:    it.id,
 				Revision:    it.rev,
-				NewRevision: d.Revision,
+				NewRevision: newRevision,
 				Config:      cloneRaw(it.cfg),
 			})
 		}
