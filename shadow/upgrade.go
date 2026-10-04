@@ -638,8 +638,13 @@ func (s *Store) batchOpen(c *campaignState, cd *campaignDevice) bool {
 // 开启回滚的活动中，安装失败不直接结束设备，而是保留原失败原因与时间、
 // 令设备等待回滚；回滚失败必须给出原因，设备以回滚失败结束且影子不变。
 // 已领取且尚未接受结果的操作在截止时刻及以后提交时，结果已经迟到：
-// 不校验附带上报与失败原因、不接收为操作结果，直接按截止处理——未结束设备
-// 全部超时（等待或正在回滚的记回滚超时），活动以失败结束，返回 ErrCampaignEnded。
+// 不校验附带上报与失败原因、不接收为操作结果。活动仍在执行时，首次这样的
+// 提交触发截止处理——未结束设备全部超时（等待或正在回滚的记回滚超时），
+// 活动以本次提交时间失败结束，该时间仍推进时间基线并参与后续倒退判断，
+// 返回 ErrCampaignEnded。活动此前已被截止处理结束时（如经 AdvanceCampaign），
+// 迟到提交只返回 ErrCampaignEnded：不推进时间基线、不改变活动结束时间与
+// 设备超时时间、不增加历史、不写影子，也不落盘，使随后不晚于原结束时间的
+// 合法调用不会被误判为时间倒退。
 // 普通设备上报不经过本方法，也不会推进活动。
 func (s *Store) SubmitResult(res OperationResult) error {
 	s.mu.Lock()
@@ -683,12 +688,18 @@ func (s *Store) SubmitResult(res OperationResult) error {
 		return fmt.Errorf("%w: %s", ErrOperationNotClaimed, res.OperationID)
 	}
 	// 已领取且尚未接受结果的操作在截止时刻及以后提交：结果已经迟到，
-	// 不再接收为操作结果，也不校验附带上报或失败原因——直接按截止处理：
-	// 未结束设备全部超时（等待/正在回滚的记回滚超时），活动以失败结束，
-	// 状态时间与活动结束时间采用本次提交时间，返回 ErrCampaignEnded。
-	// 活动可能已被显式推进到截止而结束：applyTimeout 对已结束活动是空操作，
-	// 结果仍按截止拒绝，不能因附带配置非法或缺少原因改成相应的校验错误。
+	// 不再接收为操作结果，也不校验附带上报或失败原因。
 	if !res.At.Before(c.Deadline) {
+		if c.Ended {
+			// 活动此前已被截止处理结束（如经 AdvanceCampaign）：迟到提交只是
+			// 纯拒绝，不推进时间基线、不改结束时间与设备超时时间、不增加历史、
+			// 不写影子、也不落盘。applyTimeout 对已结束活动本为空操作，因此
+			// 无需 commit。
+			return ErrCampaignEnded
+		}
+		// 活动仍在执行：首次迟到提交触发截止处理，未结束设备全部超时
+		// （等待/正在回滚的记回滚超时），活动以失败结束；状态时间与活动
+		// 结束时间采用本次提交时间，该时间确实推进时间基线并参与后续倒退判断。
 		if err := s.commit(func() error {
 			c.LastTime = res.At
 			s.applyTimeout(c, res.At)
@@ -729,14 +740,6 @@ func (s *Store) SubmitResult(res OperationResult) error {
 	}
 	var reject error
 	err = s.commit(func() error {
-		// 活动已结束且提交时间越过截止时间：只推进时间基线并拒绝
-		// （未结束活动的截止处理已在提交前完成，不会到达这里）。
-		if !res.At.Before(c.Deadline) {
-			c.LastTime = res.At
-			s.applyTimeout(c, res.At)
-			reject = ErrCampaignEnded
-			return nil
-		}
 		if c.Ended {
 			// 活动结束后的新结果：拒绝且不改状态（重复结果已在提交前处理）。
 			reject = ErrCampaignEnded
