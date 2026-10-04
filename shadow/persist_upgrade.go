@@ -504,6 +504,32 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 					ErrCorruptStorage, id, c.Status)
 			}
 		}
+		// 时间基线是活动已接受的最晚时间，必须不早于任何已记录的业务时间：
+		// 创建时间（上面已查）、任一操作的领取时间与首次接受结果的时间、
+		// 设备当前状态时间，以及已结束活动的结束时间。只比较确实存在的记录：
+		// 未领取的操作没有领取时间、未接受结果的操作没有结果时间、尚未推进的
+		// 设备没有状态时间，这些零值不参与判断。相等的时刻合法；Before 按
+		// 绝对时刻比较，同一时刻的不同时区表示得到相同结果。基线更晚是正常
+		// 的（显式推进或离线、窗口外的领取查询都会接受更晚的时间）。
+		for _, cd := range c.Devices {
+			for _, o := range []opState{cd.Download, cd.Install, cd.Rollback} {
+				if o.Claimed && c.LastTime.Before(o.ClaimedAt) {
+					return fmt.Errorf("%w: campaign %s last time before claim time",
+						ErrCorruptStorage, id)
+				}
+				if o.HasResult && c.LastTime.Before(o.At) {
+					return fmt.Errorf("%w: campaign %s last time before result time",
+						ErrCorruptStorage, id)
+				}
+			}
+			if !cd.At.IsZero() && c.LastTime.Before(cd.At) {
+				return fmt.Errorf("%w: campaign %s last time before device state time",
+					ErrCorruptStorage, id)
+			}
+		}
+		if c.Ended && c.LastTime.Before(c.EndedAt) {
+			return fmt.Errorf("%w: campaign %s last time before ended time", ErrCorruptStorage, id)
+		}
 		out[id] = c
 	}
 	// 设备不能同时参加多个未结束活动。
