@@ -48,9 +48,12 @@ type batchDeviceState struct {
 // 请求标识在当前存储内唯一：相同标识再次提交相同内容（设备次序、JSON
 // 空白与对象字段顺序无关，数字按数值比较，时间按同一时刻判断）直接返回
 // 首次结果，不重复修改；相同标识提交不同内容返回 ErrRequestConflict，
-// 原结果保持有效。任一设备校验失败（列表为空、标识为空或重复、设备未
-// 登记、配置非法、修订号冲突）时整批报错，所有设备状态、审计均不变，
-// 也不占用请求标识。离线设备同样接受修改。
+// 原结果保持有效。只要请求自身格式合法（标识、操作者、时间、设备列表
+// 非空且不重复、配置为完整 JSON 对象），已成功的标识就按首次提交内容
+// 判断重发或冲突，更换或增加设备即使涉及未登记设备也返回冲突而非
+// ErrDeviceNotFound。新标识下任一设备校验失败（列表为空、标识为空或
+// 重复、设备未登记、配置非法、修订号冲突）时整批报错，所有设备状态、
+// 审计均不变，也不占用请求标识。离线设备同样接受修改。
 func (s *Store) BatchUpdateDesired(requestID, operator string, at time.Time, devices []BatchDevice) (BatchRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -70,6 +73,9 @@ func (s *Store) BatchUpdateDesired(requestID, operator string, at time.Time, dev
 		return BatchRecord{}, ErrInvalidDeviceList
 	}
 	// 先校验并复制全部输入，再决定是否落库；任何一步失败都不改变状态。
+	// 此处只检查请求自身格式（标识非空且不重复、配置为完整 JSON 对象），
+	// 不查设备登记：标识已有成功记录时按首次内容判断重发或冲突，与设备
+	// 当前是否登记无关。
 	type prepared struct {
 		dev *deviceState
 		id  string
@@ -86,23 +92,28 @@ func (s *Store) BatchUpdateDesired(requestID, operator string, at time.Time, dev
 			return BatchRecord{}, fmt.Errorf("%w: %s", ErrDuplicateDevice, bd.DeviceID)
 		}
 		seen[bd.DeviceID] = true
-		d, ok := s.devices[bd.DeviceID]
-		if !ok {
-			return BatchRecord{}, fmt.Errorf("%w: %s", ErrDeviceNotFound, bd.DeviceID)
-		}
 		cfg, err := validateConfig(bd.Config)
 		if err != nil {
 			return BatchRecord{}, err
 		}
-		items = append(items, prepared{dev: d, id: bd.DeviceID, rev: bd.Revision, cfg: cfg})
+		items = append(items, prepared{id: bd.DeviceID, rev: bd.Revision, cfg: cfg})
 	}
 	// 已成功的请求标识：内容一致直接返回首次结果（即使设备此后已有新
-	// 修改，也不用旧请求覆盖）；内容不同返回可区分的冲突错误。
+	// 修改，也不用旧请求覆盖）；内容不同返回可区分的冲突错误。更换或
+	// 增加设备都属于内容变化，无论涉及的设备是否已登记。
 	if rec, ok := s.batches[requestID]; ok {
 		if rec.matches(operator, at, devices) {
 			return rec.record(), nil
 		}
 		return BatchRecord{}, fmt.Errorf("%w: %s", ErrRequestConflict, requestID)
+	}
+	// 新标识才做整批校验：任一设备未登记则整批报错，不占用请求标识。
+	for i := range items {
+		d, ok := s.devices[items[i].id]
+		if !ok {
+			return BatchRecord{}, fmt.Errorf("%w: %s", ErrDeviceNotFound, items[i].id)
+		}
+		items[i].dev = d
 	}
 	// 修订号冲突检查在任何修改之前完成，失败整批不变。
 	for _, it := range items {
