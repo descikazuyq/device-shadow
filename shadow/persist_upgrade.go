@@ -621,6 +621,16 @@ func validateRollbackDisk(campaignID string, dd diskDev) error {
 	if dd.RollbackTarget != "" && !dd.Download.Claimed {
 		return bad("rollback target locked before download claim")
 	}
+	// 已领取下载且尚无下载结果，或已有成功的下载结果：首次领取下载时就已锁定
+	// 回滚目标，保存记录必须包含非空目标；字段缺失与空串按同一种损坏处理。
+	// 这项要求不因设备进入安装阶段或活动已经结束而取消。锁定目标是首次领取
+	// 下载时设备的当前版本，恢复时不能用设备当前影子版本、活动目标版本或允许
+	// 升级的版本列表顶替，也不能为了继续打开而当作未开启回滚。
+	// 唯一允许的例外是领取前复查版本不兼容、直接在下载阶段失败的设备：
+	// 其下载结果已失败，不会进入安装或回滚，可以没有目标。
+	if dd.Download.Claimed && (!dd.Download.HasResult || dd.Download.Success) && dd.RollbackTarget == "" {
+		return bad("rollback target missing after download claim")
+	}
 	// 进入回滚流程的设备必然经过成功下载，目标一定已锁定。
 	if isRollbackFlowStatus(dd.Status) && dd.RollbackTarget == "" {
 		return bad("rollback status without locked target")
