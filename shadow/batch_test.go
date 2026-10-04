@@ -447,6 +447,7 @@ func TestBatchOldStorageOpens(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, storeFileName), []byte(
 		`{"format":1,"devices":{"dev-1":{"version":"1.0","online":false,"revision":1,`+
 			`"desired":{"a":1},"reported":{},"lastSeq":0,`+
+			`"diffSince":{"/a":"2026-10-02T12:00:00Z"},`+
 			`"audit":[{"operator":"op","time":"2026-10-02T12:00:00Z","revision":1,"before":{},"after":{"a":1}}]}}}`),
 		0o644); err != nil {
 		t.Fatal(err)

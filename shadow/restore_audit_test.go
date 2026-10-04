@@ -20,14 +20,15 @@ type fixAudit struct {
 }
 
 type fixState struct {
-	Version        string     `json:"version"`
-	Online         bool       `json:"online"`
-	Revision       uint64     `json:"revision"`
-	Desired        any        `json:"desired"`
-	Reported       any        `json:"reported"`
-	LastSeq        uint64     `json:"lastSeq,omitempty"`
-	LastReportTime string     `json:"lastReportTime,omitempty"`
-	Audit          []fixAudit `json:"audit,omitempty"`
+	Version        string            `json:"version"`
+	Online         bool              `json:"online"`
+	Revision       uint64            `json:"revision"`
+	Desired        any               `json:"desired"`
+	Reported       any               `json:"reported"`
+	LastSeq        uint64            `json:"lastSeq,omitempty"`
+	LastReportTime string            `json:"lastReportTime,omitempty"`
+	DiffSince      map[string]string `json:"diffSince,omitempty"`
+	Audit          []fixAudit        `json:"audit,omitempty"`
 }
 
 type fixStore struct {
@@ -52,10 +53,11 @@ func writeFixStore(t *testing.T, doc fixStore) (string, []byte) {
 func twoAuditDoc() fixStore {
 	return fixStore{Format: 1, Devices: map[string]fixState{
 		"dev-1": {
-			Version:  "1.0",
-			Revision: 2,
-			Desired:  json.RawMessage(`{"a":2}`),
-			Reported: json.RawMessage(`{}`),
+			Version:   "1.0",
+			Revision:  2,
+			Desired:   json.RawMessage(`{"a":2}`),
+			Reported:  json.RawMessage(`{}`),
+			DiffSince: map[string]string{"/a": "2026-10-02T12:00:00Z"},
 			Audit: []fixAudit{
 				{Operator: "alice", Time: "2026-10-02T12:00:00Z", Revision: 1, Before: json.RawMessage(`{}`), After: json.RawMessage(`{"a":1}`)},
 				{Operator: "bob", Time: "2026-10-02T12:01:00Z", Revision: 2, Before: json.RawMessage(`{"a":1}`), After: json.RawMessage(`{"a":2}`)},
@@ -102,6 +104,7 @@ func TestRestoreZeroRevisionAccepted(t *testing.T) {
 			Reported:       json.RawMessage(`{"cpu":80}`),
 			LastSeq:        7,
 			LastReportTime: "2026-10-02T12:00:00Z",
+			DiffSince:      map[string]string{"/cpu": "2026-10-02T12:00:00Z"},
 		},
 	}})
 	s, err := Open(dir)
@@ -123,10 +126,11 @@ func TestRestoreZeroRevisionAccepted(t *testing.T) {
 func TestRestoreAuditChainSemanticEquality(t *testing.T) {
 	dir, _ := writeFixStore(t, fixStore{Format: 1, Devices: map[string]fixState{
 		"dev-1": {
-			Version:  "1.0",
-			Revision: 2,
-			Desired:  json.RawMessage(`{ "a": 1.0 }`),
-			Reported: json.RawMessage(`{}`),
+			Version:   "1.0",
+			Revision:  2,
+			Desired:   json.RawMessage(`{ "a": 1.0 }`),
+			Reported:  json.RawMessage(`{}`),
+			DiffSince: map[string]string{"/a": "2026-10-02T12:00:00Z"},
 			Audit: []fixAudit{
 				// 时间晚于第二条；after 用 1 与期望中的 1.0 按数值比较
 				{Operator: "alice", Time: "2026-10-02T12:05:00Z", Revision: 1, Before: json.RawMessage(`{ }`), After: json.RawMessage(`{"a":1}`)},
