@@ -181,6 +181,13 @@ type expectedHist struct {
 // 结果历史都必须自洽，否则整个存储拒绝打开。
 func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 	out := make(map[string]*campaignState, len(disk))
+	// newOpIDs 收集修复后新标识家族中的全部操作标识，强制其在整个存储内唯一；
+	// 修复前旧标识家族天然可能跨活动重名，按活动与设备上下文消歧，不在此列。
+	newOpIDs := map[string]bool{}
+	// legacyOpOwner 记录每个修复前旧标识所属的活动与设备。旧标识本身可能因活动
+	// 或设备标识含冒号而跨活动重名（如活动 a:b 的设备 c 与活动 a 的设备 b:c）；
+	// 一旦同一旧标识指向两台不同的设备，归属就无法判定，属于保存矛盾，拒绝打开。
+	legacyOpOwner := map[string][2]string{}
 	for id, dc := range disk {
 		if id == "" || dc.ID != id {
 			return fmt.Errorf("%w: campaign id mismatch", ErrCorruptStorage)
@@ -232,6 +239,9 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 		// expected 按操作标识收集每个已有结果（HasResult）的下载/安装/回滚
 		// 操作所对应的唯一应有历史条目，随后与保存的结果历史逐条对账。
 		expected := map[string]expectedHist{}
+		// legacyFamily 记录本活动已保存标识所属家族：-1 未定、0 新标识、1 旧标识。
+		// 同一活动的全部设备必须同属一个家族，混用意味着数据矛盾。
+		legacyFamily := -1
 		for i, dd := range dc.Devices {
 			if dd.DeviceID == "" || seen[dd.DeviceID] {
 				return fmt.Errorf("%w: campaign %s device list invalid", ErrCorruptStorage, id)
@@ -252,18 +262,57 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 			wantDL := operationID(id, dd.DeviceID, StageDownload)
 			wantIN := operationID(id, dd.DeviceID, StageInstall)
 			wantRB := operationID(id, dd.DeviceID, StageRollback)
-			if dd.Download.ID != wantDL || dd.Install.ID != wantIN {
-				return fmt.Errorf("%w: campaign %s operation id mismatch", ErrCorruptStorage, id)
+			legDL := legacyOperationID(id, dd.DeviceID, StageDownload)
+			legIN := legacyOperationID(id, dd.DeviceID, StageInstall)
+			legRB := legacyOperationID(id, dd.DeviceID, StageRollback)
+			// checkID 校验单个阶段保存的标识：它必须是该活动该设备该阶段的
+			// 新标识或修复前旧标识之一；新标识还须在整个存储内全局唯一。
+			// 同一活动内的全部标识必须同属一个家族，混用即数据矛盾。
+			checkID := func(saved, newID, oldID string) error {
+				switch saved {
+				case newID:
+					if newOpIDs[newID] {
+						return fmt.Errorf("%w: campaign %s duplicated operation id", ErrCorruptStorage, id)
+					}
+					newOpIDs[newID] = true
+					if legacyFamily == 1 {
+						return fmt.Errorf("%w: campaign %s mixed operation id families", ErrCorruptStorage, id)
+					}
+					legacyFamily = 0
+				case oldID:
+					if legacyFamily == 0 {
+						return fmt.Errorf("%w: campaign %s mixed operation id families", ErrCorruptStorage, id)
+					}
+					legacyFamily = 1
+					// 旧标识跨活动重名时必须归属同一台设备，否则该标识无法区分
+					// 两台合法设备，属于保存矛盾（修复正是为消除这种串用）。
+					owner := [2]string{id, dd.DeviceID}
+					if other, dup := legacyOpOwner[oldID]; dup && other != owner {
+						return fmt.Errorf("%w: ambiguous legacy operation id %s", ErrCorruptStorage, oldID)
+					}
+					legacyOpOwner[oldID] = owner
+				default:
+					return fmt.Errorf("%w: campaign %s operation id mismatch", ErrCorruptStorage, id)
+				}
+				return nil
+			}
+			if err := checkID(dd.Download.ID, wantDL, legDL); err != nil {
+				return err
+			}
+			if err := checkID(dd.Install.ID, wantIN, legIN); err != nil {
+				return err
 			}
 			if dc.RollbackOnFailure {
-				if dd.Rollback.ID != wantRB {
-					return fmt.Errorf("%w: campaign %s rollback op id mismatch", ErrCorruptStorage, id)
+				if err := checkID(dd.Rollback.ID, wantRB, legRB); err != nil {
+					return err
 				}
 			} else {
 				// 未开启回滚的活动（含旧存储）不得残留任何回滚进展；
-				// 回滚标识允许缺省（旧存储）或等于稳定标识（新存储）。
-				if dd.Rollback.ID != "" && dd.Rollback.ID != wantRB {
-					return fmt.Errorf("%w: campaign %s rollback op id mismatch", ErrCorruptStorage, id)
+				// 回滚标识允许缺省（旧存储）、等于旧标识或等于新标识。
+				if dd.Rollback.ID != "" {
+					if err := checkID(dd.Rollback.ID, wantRB, legRB); err != nil {
+						return err
+					}
 				}
 				if dd.RollbackTarget != "" ||
 					dd.Rollback.Claimed || dd.Rollback.HasResult ||
@@ -340,8 +389,12 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 			}
 			rbOp := decodeOp(dd.Rollback)
 			if !dc.RollbackOnFailure {
-				// 与创建路径一致：内存中始终持有稳定的回滚操作标识。
-				rbOp = opState{ID: wantRB}
+				// 与创建路径一致：内存中始终持有该活动家族对应的回滚操作标识。
+				rbID := wantRB
+				if legacyFamily == 1 {
+					rbID = legRB
+				}
+				rbOp = opState{ID: rbID}
 			}
 			cd := &campaignDevice{
 				DeviceID:       dd.DeviceID,
@@ -392,8 +445,10 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 			if dr.Stage == StageRollback && !dc.RollbackOnFailure {
 				return fmt.Errorf("%w: campaign %s rollback result in non-rollback campaign", ErrCorruptStorage, id)
 			}
-			wantOp := operationID(id, dr.DeviceID, dr.Stage)
-			if dr.OperationID != wantOp {
+			// 历史中的操作标识必须与该设备该阶段实际保存的标识一致：
+			// 修复后活动为新标识，修复前活动为旧标识，不能错用另一家族。
+			savedOp := opIDFor(c.Devices[c.index[dr.DeviceID]], dr.Stage)
+			if dr.OperationID != savedOp {
 				return fmt.Errorf("%w: campaign %s result op id mismatch", ErrCorruptStorage, id)
 			}
 			if seenHistory[dr.OperationID] {

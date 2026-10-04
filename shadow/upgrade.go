@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"time"
 )
 
@@ -334,8 +335,116 @@ func (s *Store) deviceBusy(deviceID, excludeCampaign string) bool {
 	return false
 }
 
+// stageTag 是修复后操作标识末尾使用的阶段标记。它们刻意不同于完整阶段名，
+// 使新生成的标识（以 :dl/:ins/:rb 结尾）不可能与修复前保存的旧标识
+// （以 :download/:install/:rollback 结尾）相同，两个标识家族因此互不相交。
+var stageTag = map[string]string{
+	StageDownload: "dl",
+	StageInstall:  "ins",
+	StageRollback: "rb",
+}
+
+// operationID 生成新创建活动使用的操作标识，明确区分活动、设备与阶段。
+//
+// 格式为“长度前缀 + 原值”的拼接：
+//
+//	len(campaignID):campaignID len(deviceID):deviceID :tag
+//
+// 例如活动 a:b、设备 c 的下载操作为 "3:a:b1:c:dl"，而活动 a、设备 b:c 为
+// "1:a3:b:c:dl"，二者不再相同。长度按字节计数并以十进制给出，随后紧跟 ':'
+// 分隔符，因此标识串对任意非空活动/设备字符串（含冒号、中文）都可唯一还原，
+// 同一设备不同阶段靠末尾的阶段标记区分。标识只用于无歧义地定位操作，活动与
+// 设备本身始终按原字符串精确匹配，不做截断或字符限制。
 func operationID(campaignID, deviceID, stage string) string {
+	return strconv.Itoa(len(campaignID)) + ":" + campaignID +
+		strconv.Itoa(len(deviceID)) + ":" + deviceID + ":" + stageTag[stage]
+}
+
+// legacyOperationID 返回修复前使用的操作标识 campaignID:deviceID:stage。
+// 仅用于识别和兼容修复前正常保存的活动，新活动不再使用它。
+func legacyOperationID(campaignID, deviceID, stage string) string {
 	return campaignID + ":" + deviceID + ":" + stage
+}
+
+// parseOperationID 按 operationID 的长度前缀格式还原活动、设备与阶段。
+// 任何不符合该格式、长度与声明不符或阶段标记未知的输入都返回 ok=false；
+// 特别地，修复前的旧标识（以完整阶段名结尾）无法通过本解析。
+func parseOperationID(id string) (campaignID, deviceID, stage string, ok bool) {
+	campaignID, rest, ok := readLenPrefixed(id)
+	if !ok {
+		return "", "", "", false
+	}
+	deviceID, rest, ok = readLenPrefixed(rest)
+	if !ok {
+		return "", "", "", false
+	}
+	if len(rest) == 0 || rest[0] != ':' {
+		return "", "", "", false
+	}
+	switch rest[1:] {
+	case stageTag[StageDownload]:
+		stage = StageDownload
+	case stageTag[StageInstall]:
+		stage = StageInstall
+	case stageTag[StageRollback]:
+		stage = StageRollback
+	default:
+		return "", "", "", false
+	}
+	return campaignID, deviceID, stage, true
+}
+
+// readLenPrefixed 读取并去掉串首的一个“十进制长度:值”段，要求长度为正、
+// 声明的字节数不越界。返回取出的值与剩余串。
+func readLenPrefixed(s string) (value, rest string, ok bool) {
+	i := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	if i == 0 || i >= len(s) || s[i] != ':' {
+		return "", "", false
+	}
+	n, err := strconv.Atoi(s[:i])
+	if err != nil || n <= 0 {
+		return "", "", false
+	}
+	start := i + 1
+	end := start + n
+	if end > len(s) {
+		return "", "", false
+	}
+	return s[start:end], s[end:], true
+}
+
+// resolveOperation 在指定活动与设备上把提交的操作标识定位到具体阶段。
+//
+// 保存的阶段标识（修复前活动为旧标识、修复后活动为新标识）直接命中；否则按新
+// 格式解析标识，并校验解析出的活动与设备与提交目标完全一致，使修复前活动也能用
+// 其等价的新标识提交。标识属于其他活动或其他设备、或格式无法解析时 found=false，
+// 由调用方返回 ErrOperationNotFound，绝不按字符串巧合串用。
+func resolveOperation(c *campaignState, cd *campaignDevice, id string) (stage string, op *opState, found bool) {
+	switch id {
+	case cd.Download.ID:
+		return StageDownload, &cd.Download, true
+	case cd.Install.ID:
+		return StageInstall, &cd.Install, true
+	case cd.Rollback.ID:
+		return StageRollback, &cd.Rollback, true
+	}
+	cid, did, parsedStage, ok := parseOperationID(id)
+	if !ok || cid != c.ID || did != cd.DeviceID {
+		return "", nil, false
+	}
+	switch parsedStage {
+	case StageDownload:
+		return StageDownload, &cd.Download, true
+	case StageInstall:
+		return StageInstall, &cd.Install, true
+	case StageRollback:
+		return StageRollback, &cd.Rollback, true
+	default:
+		return "", nil, false
+	}
 }
 
 func containsString(list []string, v string) bool {
@@ -539,17 +648,12 @@ func (s *Store) SubmitResult(res OperationResult) error {
 	if res.At.IsZero() {
 		return ErrInvalidTime
 	}
-	// 定位操作标识所属阶段；不属于本设备的操作一律视为未知。
-	var stage string
-	var op *opState
-	switch res.OperationID {
-	case cd.Download.ID:
-		stage, op = StageDownload, &cd.Download
-	case cd.Install.ID:
-		stage, op = StageInstall, &cd.Install
-	case cd.Rollback.ID:
-		stage, op = StageRollback, &cd.Rollback
-	default:
+	// 定位操作标识所属阶段。先匹配该设备保存的阶段标识（修复前活动保存的是旧
+	// 标识，修复后活动保存的是新标识）；不匹配时再按新格式解析，并要求解析出的
+	// 活动与设备与本次提交一致——这样旧活动也接受按新格式算出的等价标识，而带上
+	// 另一活动或另一设备的标识一律视为未知。不属于本设备本活动的操作返回未知。
+	stage, op, found := resolveOperation(c, cd, res.OperationID)
+	if !found {
 		return fmt.Errorf("%w: %s", ErrOperationNotFound, res.OperationID)
 	}
 	// 已接受结果：相同结果幂等（活动结束后仍有效，不增加历史、不重复放行），

@@ -253,7 +253,7 @@ func TestRestoreEndedCampaignHistoryCoexistsWithActive(t *testing.T) {
 			t.Fatalf("pending install missing: %+v", w)
 		}
 		if w.Pending.Kind != StageInstall ||
-			w.Pending.ID != "cmp-2:d1:install" ||
+			w.Pending.ID != operationID("cmp-2", "d1", StageInstall) ||
 			w.PendingClaimed {
 			t.Fatalf("pending work changed after restore: %+v", w)
 		}
@@ -282,7 +282,7 @@ func TestRestoreEndedCampaignHistoryCoexistsWithActive(t *testing.T) {
 		createCampaign(t, src, newSpec)
 		bringOnline(t, src, "d1")
 		dl, err := src.Claim(newSpec.ID, "d1", base2)
-		if err != nil || dl == nil || dl.ID != "cmp-2:d1:download" {
+		if err != nil || dl == nil || dl.ID != operationID("cmp-2", "d1", StageDownload) {
 			t.Fatalf("claim download: %v %+v", err, dl)
 		}
 		wantWork, err := src.GetDeviceWork("d1")
@@ -313,7 +313,7 @@ func TestRestoreEndedCampaignHistoryCoexistsWithActive(t *testing.T) {
 		if w.CampaignID != "cmp-2" || w.Pending == nil {
 			t.Fatalf("work must point to cmp-2 pending op: %+v", w)
 		}
-		if w.Pending.Kind != StageDownload || w.Pending.ID != "cmp-2:d1:download" ||
+		if w.Pending.Kind != StageDownload || w.Pending.ID != operationID("cmp-2", "d1", StageDownload) ||
 			!w.PendingClaimed {
 			t.Fatalf("claimed download not restored as saved: %+v", w)
 		}

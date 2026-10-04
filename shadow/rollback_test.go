@@ -262,10 +262,10 @@ func TestRollbackClaimWindowOnlineAndStableID(t *testing.T) {
 	if err != nil || rb == nil {
 		t.Fatalf("claim rollback in window: %v %+v", err, rb)
 	}
-	if rb.Kind != StageRollback || rb.TargetVersion != "v1" || rb.ID != "cmp-1:d1:rollback" {
+	if rb.Kind != StageRollback || rb.TargetVersion != "v1" || rb.ID != operationID("cmp-1", "d1", StageRollback) {
 		t.Fatalf("rollback op: %+v", rb)
 	}
-	if rb.ID == inID || rb.ID == "cmp-1:d1:download" {
+	if rb.ID == inID || rb.ID == operationID("cmp-1", "d1", StageDownload) {
 		t.Fatalf("rollback id must differ from download/install: %s", rb.ID)
 	}
 	// 正在回滚的设备同样不能参加其他活动。
@@ -448,7 +448,7 @@ func TestRollbackIdempotencyConflictUnclaimed(t *testing.T) {
 
 	// 提交未领取的回滚操作：报错且不改状态。
 	if err := s.SubmitResult(OperationResult{
-		CampaignID: spec.ID, DeviceID: "d1", OperationID: "cmp-1:d1:rollback",
+		CampaignID: spec.ID, DeviceID: "d1", OperationID: operationID("cmp-1", "d1", StageRollback),
 		At: upBase.Add(8 * time.Minute), Success: false, Reason: "early",
 	}); !errors.Is(err, ErrOperationNotClaimed) {
 		t.Fatalf("unclaimed rollback: %v", err)
@@ -644,7 +644,7 @@ func TestRollbackPersistenceReopen(t *testing.T) {
 	}
 	d1 := findDevice(v, "d1")
 	if d1.Status != DeviceRollingBack || d1.RollbackTarget != "v1" ||
-		d1.RollbackID != "cmp-1:d1:rollback" || d1.InstallFailAt.IsZero() {
+		d1.RollbackID != operationID("cmp-1", "d1", StageRollback) || d1.InstallFailAt.IsZero() {
 		t.Fatalf("d1 rollback progress after reopen: %+v", d1)
 	}
 	if !d1.InstallFailAt.Equal(failAt) {
