@@ -229,11 +229,10 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 			EndedAt:           dc.EndedAt,
 			index:             map[string]int{},
 		}
+		// 旧记录可能没有时间基线：缺省（零值）时仍以创建时间作为基线。
+		// 基线与各业务记录时间是否自洽在设备与历史全部恢复后统一检查。
 		if c.LastTime.IsZero() {
 			c.LastTime = c.CreatedAt
-		}
-		if c.LastTime.Before(c.CreatedAt) {
-			return fmt.Errorf("%w: campaign %s last time before creation", ErrCorruptStorage, id)
 		}
 		seen := map[string]bool{}
 		// expected 按操作标识收集每个已有结果（HasResult）的下载/安装/回滚
@@ -504,6 +503,11 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 					ErrCorruptStorage, id, c.Status)
 			}
 		}
+		// 时间基线必须能解释全部已存在的业务记录，否则重开后本应被拒绝的
+		// 旧时间请求又能推进活动。不能抬高基线或改写任何记录来掩盖矛盾。
+		if err := checkCampaignTimeBaseline(id, c); err != nil {
+			return err
+		}
 		out[id] = c
 	}
 	// 设备不能同时参加多个未结束活动。
@@ -521,6 +525,55 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 		}
 	}
 	s.campaigns = out
+	return nil
+}
+
+// checkCampaignTimeBaseline 校验活动时间基线（已接受的最新时间）与保存的
+// 业务记录自洽：基线必须不早于创建时间、任一设备已经领取下载/安装/回滚的
+// 时间、任一操作首次接受结果的时间、设备当前状态中已记录的时间；活动已结束
+// 时还必须不早于保存的结束时间。只比较确实存在的记录：尚未领取的操作没有
+// 领取时间、尚未接受结果的操作没有结果时间、新建且尚未推进的设备允许没有
+// 状态时间，这些正常缺省值不导致打开失败。比较按绝对时刻进行，相等合法。
+func checkCampaignTimeBaseline(campaignID string, c *campaignState) error {
+	baseline := c.LastTime
+	bad := func(format string, args ...any) error {
+		msg := fmt.Sprintf(format, args...)
+		return fmt.Errorf("%w: campaign %s time baseline %s %s",
+			ErrCorruptStorage, campaignID, baseline.Format(time.RFC3339Nano), msg)
+	}
+	if baseline.Before(c.CreatedAt) {
+		return bad("before creation time %s", c.CreatedAt.Format(time.RFC3339Nano))
+	}
+	if c.Ended && !c.EndedAt.IsZero() && baseline.Before(c.EndedAt) {
+		return bad("before end time %s", c.EndedAt.Format(time.RFC3339Nano))
+	}
+	for _, cd := range c.Devices {
+		if !cd.At.IsZero() && baseline.Before(cd.At) {
+			return bad("before device %s state time %s",
+				cd.DeviceID, cd.At.Format(time.RFC3339Nano))
+		}
+		// 已领取（含尚未完成）的操作一定接受过携带领取时刻的请求；
+		// 已接受结果的操作还必须比较首次接受结果的时间。未领取/未接受
+		// 的操作对应时间为零值，属正常缺省，跳过比较。
+		ops := []struct {
+			stage string
+			op    *opState
+		}{
+			{StageDownload, &cd.Download},
+			{StageInstall, &cd.Install},
+			{StageRollback, &cd.Rollback},
+		}
+		for _, item := range ops {
+			if !item.op.ClaimedAt.IsZero() && baseline.Before(item.op.ClaimedAt) {
+				return bad("before device %s %s claim time %s",
+					cd.DeviceID, item.stage, item.op.ClaimedAt.Format(time.RFC3339Nano))
+			}
+			if item.op.HasResult && !item.op.At.IsZero() && baseline.Before(item.op.At) {
+				return bad("before device %s %s result time %s",
+					cd.DeviceID, item.stage, item.op.At.Format(time.RFC3339Nano))
+			}
+		}
+	}
 	return nil
 }
 
