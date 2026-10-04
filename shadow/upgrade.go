@@ -473,9 +473,19 @@ func containsString(list []string, v string) bool {
 // 且时间位于原维护窗口 [start, end) 内（不受批次放行影响），返回的操作带锁定
 // 目标版本；离线或窗口外保留待办。回滚已领取但未完成时再次查询返回同一标识，
 // 且可在窗口外、截止前提交结果。
-// 已领取但未完成的操作（下载/安装/回滚）再次查询时返回同一标识，不要求在线或位于窗口内。
+// 已领取但未完成的操作（下载/安装/回滚）在活动仍在执行时再次查询返回同一标识，
+// 不要求在线或位于窗口内；活动结束后则不返回任何操作。
 // 离线设备保留待办；离线或窗口外暂无可领取的新操作时返回 (nil, nil)。
-// 时间缺失或相对本活动已接受的时间倒退时拒绝，且不改变状态。
+// 活动仍在执行而领取时间首次到达截止时，不派发操作，未结束设备全部按阶段记为
+// 超时（等待/正在回滚的记回滚超时），已有终态不变，以本次领取时间结束活动并
+// 返回 ErrCampaignEnded；即使请求领取的设备早已成功，其他未结束设备仍被级联处理，
+// 本次结束时间仍参与后续倒退判断。
+// 活动已经结束（截止超时，或截止前已全部成功/失败结束）后的领取一律返回空操作和
+// ErrCampaignEnded，是不推进时间基线、不改任何状态的纯拒绝：无论领取时间在原截止
+// 前、恰好截止或截止后，也无论下载、安装或回滚是否曾领取但未完成，活动结论与结束
+// 时间、设备状态与状态时间、结果历史和影子都保持原状，被拒绝的时间也不落盘。
+// 时间缺失返回 ErrInvalidTime；相对本活动真正已接受的时间倒退返回 ErrTimeRegression，
+// 且均不改变状态。
 func (s *Store) Claim(campaignID, deviceID string, at time.Time) (*Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -495,16 +505,22 @@ func (s *Store) Claim(campaignID, deviceID string, at time.Time) (*Operation, er
 	var op *Operation
 	var reject error
 	err = s.commit(func() error {
-		// 到达截止时间：未结束设备全部超时并落盘，本次领取拒绝。
-		// 即使查询的设备已有终态，其他未结束设备仍要级联超时。
-		if !at.Before(c.Deadline) {
-			c.LastTime = at
-			s.applyTimeout(c, at)
+		// 活动已经结束（截止超时，或截止前已全部成功/失败结束）：纯拒绝。
+		// 即使本次领取时间达到或晚于截止时间，即使查询的设备此前已领取
+		// 下载/安装/回滚但未完成，也不返回任何操作，不推进时间基线，
+		// 不改结束时间、活动结论、设备状态与状态时间、结果历史和影子，
+		// 否则随后原本合法的时间会因这次拒绝而被判为倒退。
+		if c.Ended {
 			reject = ErrCampaignEnded
 			return nil
 		}
-		if c.Ended {
-			// 纯拒绝路径：不推进时间基线，不改状态。
+		// 活动仍在执行且时间首次到达截止：不派发操作，未结束设备全部
+		// 超时（等待/正在回滚的记回滚超时），已有终态保持不变，以本次
+		// 领取时间结束活动。即使查询的设备早已成功，其他未结束设备仍要
+		// 级联超时；本次确实推进的时间仍参与后续倒退判断。
+		if !at.Before(c.Deadline) {
+			c.LastTime = at
+			s.applyTimeout(c, at)
 			reject = ErrCampaignEnded
 			return nil
 		}
