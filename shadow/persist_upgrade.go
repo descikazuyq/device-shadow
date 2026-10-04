@@ -206,9 +206,8 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 		if dc.IDScheme != opIDSchemeLegacy && dc.IDScheme != opIDSchemeV2 {
 			return fmt.Errorf("%w: campaign %s unknown operation id scheme", ErrCorruptStorage, id)
 		}
-		if dc.Ended == (dc.Status == CampaignRunning) {
-			return fmt.Errorf("%w: campaign %s ended/status mismatch", ErrCorruptStorage, id)
-		}
+		// 活动结论是否与设备进度一致在设备与历史全部对账完成后统一核对，
+		// 这里不再只做 ended 与 status 的表面比对。
 		if len(dc.Devices) == 0 {
 			return fmt.Errorf("%w: campaign %s has no devices", ErrCorruptStorage, id)
 		}
@@ -473,6 +472,25 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 				return fmt.Errorf("%w: campaign %s device %s %s result missing history",
 					ErrCorruptStorage, id, want.deviceID, want.stage)
 			}
+		}
+		// 活动结论必须与设备进度一致，不能以保存的 status/ended 表面值为准：
+		// 任一设备尚未终态（等待下载、下载中、等待安装、安装中、等待回滚、
+		// 回滚中）时活动必须是 running 且 Ended 为 false；全部设备终态时活动
+		// 必须已结束，且只有每台设备都 succeeded 才能是 succeeded——回滚成功
+		// 只表示恢复原版本，其余任何组合（失败、超时、未执行、回滚成功/失败/
+		// 超时）都只能是 failed。矛盾即损坏，拒绝打开整个存储，也不改写结论或
+		// 设备状态来掩盖矛盾。
+		probe := *c
+		complete := finishCampaignIfComplete(&probe, probe.EndedAt)
+		switch {
+		case !complete:
+			if c.Ended || c.Status != CampaignRunning {
+				return fmt.Errorf("%w: campaign %s ended while devices are unfinished",
+					ErrCorruptStorage, id)
+			}
+		case !c.Ended || c.Status != probe.Status:
+			return fmt.Errorf("%w: campaign %s status %s/ended %t inconsistent with device progress",
+				ErrCorruptStorage, id, c.Status, c.Ended)
 		}
 		out[id] = c
 	}

@@ -944,10 +944,20 @@ func (s *Store) applyTimeout(c *campaignState, at time.Time) {
 // settle 在全部设备到达终态时结束活动：全部成功则成功，否则失败。
 // 即使回滚成功，设备也不是 succeeded，活动仍为失败。
 func (s *Store) settle(c *campaignState, at time.Time) {
-	allSucceeded := true
+	if !finishCampaignIfComplete(c, at) {
+		return
+	}
+}
+
+// finishCampaignIfComplete 按设备进度核对活动结论：仍有设备未到终态时活动
+// 必须保持 running，返回 false；全部设备终态时活动结束，结论只能是
+// succeeded（每台设备均 succeeded）或 failed（其余任何组合），返回 true。
+// 设备进度是唯一依据：回滚成功只表示恢复到原版本，不算本次升级成功。
+func finishCampaignIfComplete(c *campaignState, at time.Time) bool {
+	allSucceeded := len(c.Devices) > 0
 	for _, cd := range c.Devices {
 		if !isTerminal(cd.Status) {
-			return
+			return false
 		}
 		if cd.Status != DeviceSucceeded {
 			allSucceeded = false
@@ -960,6 +970,7 @@ func (s *Store) settle(c *campaignState, at time.Time) {
 	} else {
 		c.Status = CampaignFailed
 	}
+	return true
 }
 
 func isTerminal(status string) bool {
