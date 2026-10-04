@@ -476,6 +476,13 @@ func containsString(list []string, v string) bool {
 // 已领取但未完成的操作（下载/安装/回滚）再次查询时返回同一标识，不要求在线或位于窗口内。
 // 离线设备保留待办；离线或窗口外暂无可领取的新操作时返回 (nil, nil)。
 // 时间缺失或相对本活动已接受的时间倒退时拒绝，且不改变状态。
+// 活动已结束（无论因超时还是提前成功/失败结束、无论领取时间在原截止前、
+// 恰好截止或截止后）时领取是纯拒绝：返回 ErrCampaignEnded，不推进时间基线、
+// 不改活动结论、结束时间、设备状态与状态时间、结果历史和设备影子，也不落盘，
+// 因此被拒绝的领取时间不会影响后续合法请求或重开存储后的倒退判断。
+// 活动仍在执行而领取首次到达截止时间时保留原有截止处理：不派发操作，
+// 全部未结束设备按阶段记为超时（等待或正在回滚的记回滚超时），已有终态
+// 保持不变，以本次领取时间结束活动；此次结束时间仍参与后续倒退判断。
 func (s *Store) Claim(campaignID, deviceID string, at time.Time) (*Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -492,6 +499,12 @@ func (s *Store) Claim(campaignID, deviceID string, at time.Time) (*Operation, er
 	if at.Before(c.LastTime) {
 		return nil, fmt.Errorf("%w: %v before %v", ErrTimeRegression, at, c.LastTime)
 	}
+	if c.Ended {
+		// 已结束活动的领取是纯拒绝：不推进时间基线、不改状态、不落盘，
+		// 否则被拒绝的领取时间会把基线推过真正已接受的时间，
+		// 使随后本来合法的请求被误判为时间倒退。
+		return nil, ErrCampaignEnded
+	}
 	var op *Operation
 	var reject error
 	err = s.commit(func() error {
@@ -500,11 +513,6 @@ func (s *Store) Claim(campaignID, deviceID string, at time.Time) (*Operation, er
 		if !at.Before(c.Deadline) {
 			c.LastTime = at
 			s.applyTimeout(c, at)
-			reject = ErrCampaignEnded
-			return nil
-		}
-		if c.Ended {
-			// 纯拒绝路径：不推进时间基线，不改状态。
 			reject = ErrCampaignEnded
 			return nil
 		}
