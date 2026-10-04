@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -172,6 +174,9 @@ type campaignState struct {
 	Devices           []*campaignDevice
 	index             map[string]int
 	Results           []ResultRecord
+	// idScheme 是操作标识方案（opIDScheme*），随活动持久化；
+	// 修复前保存的活动为 opIDSchemeLegacy，新活动为 opIDSchemeV2。
+	idScheme int
 	// LastTime 是本活动已接受的最晚时间，用于拒绝时间倒退。
 	LastTime time.Time
 	Status   string
@@ -275,6 +280,18 @@ func (s *Store) CreateCampaign(spec CampaignSpec) error {
 		return fmt.Errorf("%w: %s", ErrCampaignExists, spec.ID)
 	}
 	ver := s.versions[spec.TargetVersion]
+	// 新标识不能与存储内其他操作的标识相同，同一设备不同阶段也不共用：
+	// v2 编码本身按（活动, 设备, 阶段）区分，nonce 再避开与旧方案标识的偶然相同。
+	taken := s.takenOperationIDs()
+	newOpID := func(deviceID, stage string) string {
+		for nonce := 0; ; nonce++ {
+			id := encodeOperationIDV2(nonce, spec.ID, deviceID, stage)
+			if !taken[id] {
+				taken[id] = true
+				return id
+			}
+		}
+	}
 	devs := make([]*campaignDevice, 0, len(spec.Devices))
 	for i, id := range spec.Devices {
 		d, ok := s.devices[id]
@@ -292,9 +309,9 @@ func (s *Store) CreateCampaign(spec CampaignSpec) error {
 			Batch:    i / spec.BatchSize,
 			Status:   DevicePending,
 			Phase:    StageDownload,
-			Download: opState{ID: operationID(spec.ID, id, StageDownload)},
-			Install:  opState{ID: operationID(spec.ID, id, StageInstall)},
-			Rollback: opState{ID: operationID(spec.ID, id, StageRollback)},
+			Download: opState{ID: newOpID(id, StageDownload)},
+			Install:  opState{ID: newOpID(id, StageInstall)},
+			Rollback: opState{ID: newOpID(id, StageRollback)},
 		})
 	}
 	campaign := &campaignState{
@@ -309,6 +326,7 @@ func (s *Store) CreateCampaign(spec CampaignSpec) error {
 		RollbackOnFailure: spec.RollbackOnFailure,
 		Devices:           devs,
 		index:             make(map[string]int, len(devs)),
+		idScheme:          opIDSchemeV2,
 		LastTime:          spec.CreatedAt,
 		Status:            CampaignRunning,
 	}
@@ -334,8 +352,105 @@ func (s *Store) deviceBusy(deviceID, excludeCampaign string) bool {
 	return false
 }
 
+// operationID 是修复前的旧标识方案：冒号拼接。活动或设备标识含冒号时，
+// 不同（活动, 设备）组合会拼出相同标识，仅用于兼容校验修复前保存的活动；
+// 新活动一律使用 encodeOperationIDV2。
 func operationID(campaignID, deviceID, stage string) string {
 	return campaignID + ":" + deviceID + ":" + stage
+}
+
+// 操作标识方案编号，随活动一起持久化；缺省（旧存储）为旧方案。
+const (
+	opIDSchemeLegacy = 0
+	opIDSchemeV2     = 1
+)
+
+const opIDV2Prefix = "v2:"
+
+// encodeOperationIDV2 生成无歧义的操作标识：活动与设备标识用长度前缀编码，
+// 任何非空标识（含冒号、中文等）都按原字符串精确保留，（活动, 设备, 阶段）
+// 三元组与标识一一对应。nonce 用于避开与存储内已有标识（如旧方案标识）
+// 偶然相同的情形。
+func encodeOperationIDV2(nonce int, campaignID, deviceID, stage string) string {
+	return fmt.Sprintf("v2:%d:%d:%s%d:%s%s",
+		nonce, len(campaignID), campaignID, len(deviceID), deviceID, stage)
+}
+
+// parseOperationIDV2 解析 v2 操作标识，还原活动、设备与阶段。
+// 只接受规范编码（解析后原样重编码必须等于入参）。
+func parseOperationIDV2(id string) (campaignID, deviceID, stage string, ok bool) {
+	rest, found := strings.CutPrefix(id, opIDV2Prefix)
+	if !found {
+		return "", "", "", false
+	}
+	readInt := func() (int, bool) {
+		i := strings.IndexByte(rest, ':')
+		if i <= 0 {
+			return 0, false
+		}
+		n, err := strconv.Atoi(rest[:i])
+		if err != nil || n < 0 {
+			return 0, false
+		}
+		rest = rest[i+1:]
+		return n, true
+	}
+	readStr := func(n int) (string, bool) {
+		if n <= 0 || len(rest) < n {
+			return "", false
+		}
+		s := rest[:n]
+		rest = rest[n:]
+		return s, true
+	}
+	nonce, ok1 := readInt()
+	lenC, ok2 := readInt()
+	if !ok1 || !ok2 {
+		return "", "", "", false
+	}
+	campaignID, ok1 = readStr(lenC)
+	lenD, ok2 := readInt()
+	if !ok1 || !ok2 {
+		return "", "", "", false
+	}
+	deviceID, ok1 = readStr(lenD)
+	if !ok1 {
+		return "", "", "", false
+	}
+	stage = rest
+	if !validStage(stage) || encodeOperationIDV2(nonce, campaignID, deviceID, stage) != id {
+		return "", "", "", false
+	}
+	return campaignID, deviceID, stage, true
+}
+
+func validStage(stage string) bool {
+	return stage == StageDownload || stage == StageInstall || stage == StageRollback
+}
+
+// validV2OpID 校验标识是否是指定（活动, 设备, 阶段）的规范 v2 操作标识。
+func validV2OpID(opID, campaignID, deviceID, stage string) bool {
+	cid, did, st, ok := parseOperationIDV2(opID)
+	return ok && cid == campaignID && did == deviceID && st == stage
+}
+
+// takenOperationIDs 收集存储内全部活动（含已结束）正在使用或结果历史中
+// 出现过的操作标识，供新活动生成标识时避开相同值。
+func (s *Store) takenOperationIDs() map[string]bool {
+	taken := map[string]bool{}
+	for _, c := range s.campaigns {
+		for _, cd := range c.Devices {
+			taken[cd.Download.ID] = true
+			taken[cd.Install.ID] = true
+			if cd.Rollback.ID != "" {
+				taken[cd.Rollback.ID] = true
+			}
+		}
+		for _, r := range c.Results {
+			taken[r.OperationID] = true
+		}
+	}
+	return taken
 }
 
 func containsString(list []string, v string) bool {

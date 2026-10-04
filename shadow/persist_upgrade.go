@@ -14,21 +14,23 @@ type diskVersion struct {
 
 // diskCampaign 是活动的磁盘格式，设备按提交次序保存。
 type diskCampaign struct {
-	ID                string       `json:"id"`
-	Operator          string       `json:"operator"`
-	Target            string       `json:"target"`
-	CreatedAt         time.Time    `json:"createdAt"`
-	BatchSize         int          `json:"batchSize"`
-	WindowStart       time.Time    `json:"windowStart"`
-	WindowEnd         time.Time    `json:"windowEnd"`
-	Deadline          time.Time    `json:"deadline"`
-	RollbackOnFailure bool         `json:"rollbackOnFailure,omitempty"`
-	LastTime          time.Time    `json:"lastTime"`
-	Status            string       `json:"status"`
-	Ended             bool         `json:"ended"`
-	EndedAt           time.Time    `json:"endedAt,omitempty"`
-	Devices           []diskDev    `json:"devices"`
-	Results           []diskResult `json:"results,omitempty"`
+	ID                string    `json:"id"`
+	Operator          string    `json:"operator"`
+	Target            string    `json:"target"`
+	CreatedAt         time.Time `json:"createdAt"`
+	BatchSize         int       `json:"batchSize"`
+	WindowStart       time.Time `json:"windowStart"`
+	WindowEnd         time.Time `json:"windowEnd"`
+	Deadline          time.Time `json:"deadline"`
+	RollbackOnFailure bool      `json:"rollbackOnFailure,omitempty"`
+	// IDScheme 是操作标识方案（opIDScheme*）；缺省为修复前的旧方案。
+	IDScheme int          `json:"idScheme,omitempty"`
+	LastTime time.Time    `json:"lastTime"`
+	Status   string       `json:"status"`
+	Ended    bool         `json:"ended"`
+	EndedAt  time.Time    `json:"endedAt,omitempty"`
+	Devices  []diskDev    `json:"devices"`
+	Results  []diskResult `json:"results,omitempty"`
 }
 
 type diskOp struct {
@@ -88,6 +90,7 @@ func (s *Store) marshalCampaigns() (map[string]diskCampaign, error) {
 			WindowEnd:         c.WindowEnd,
 			Deadline:          c.Deadline,
 			RollbackOnFailure: c.RollbackOnFailure,
+			IDScheme:          c.idScheme,
 			LastTime:          c.LastTime,
 			Status:            c.Status,
 			Ended:             c.Ended,
@@ -200,6 +203,9 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 		if dc.Status != CampaignRunning && dc.Status != CampaignSucceeded && dc.Status != CampaignFailed {
 			return fmt.Errorf("%w: campaign %s bad status", ErrCorruptStorage, id)
 		}
+		if dc.IDScheme != opIDSchemeLegacy && dc.IDScheme != opIDSchemeV2 {
+			return fmt.Errorf("%w: campaign %s unknown operation id scheme", ErrCorruptStorage, id)
+		}
 		if dc.Ended == (dc.Status == CampaignRunning) {
 			return fmt.Errorf("%w: campaign %s ended/status mismatch", ErrCorruptStorage, id)
 		}
@@ -216,6 +222,7 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 			WindowEnd:         dc.WindowEnd,
 			Deadline:          dc.Deadline,
 			RollbackOnFailure: dc.RollbackOnFailure,
+			idScheme:          dc.IDScheme,
 			LastTime:          dc.LastTime,
 			Status:            dc.Status,
 			Ended:             dc.Ended,
@@ -249,22 +256,31 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 			if dd.Phase != StageDownload && dd.Phase != StageInstall && dd.Phase != StageRollback {
 				return fmt.Errorf("%w: campaign %s bad phase", ErrCorruptStorage, id)
 			}
-			wantDL := operationID(id, dd.DeviceID, StageDownload)
-			wantIN := operationID(id, dd.DeviceID, StageInstall)
-			wantRB := operationID(id, dd.DeviceID, StageRollback)
-			if dd.Download.ID != wantDL || dd.Install.ID != wantIN {
-				return fmt.Errorf("%w: campaign %s operation id mismatch", ErrCorruptStorage, id)
-			}
-			if dc.RollbackOnFailure {
-				if dd.Rollback.ID != wantRB {
-					return fmt.Errorf("%w: campaign %s rollback op id mismatch", ErrCorruptStorage, id)
+			if dc.IDScheme == opIDSchemeV2 {
+				// 新方案：标识必须是无歧义编码且恰好归属本活动、本设备、本阶段。
+				if !validV2OpID(dd.Download.ID, id, dd.DeviceID, StageDownload) ||
+					!validV2OpID(dd.Install.ID, id, dd.DeviceID, StageInstall) ||
+					!validV2OpID(dd.Rollback.ID, id, dd.DeviceID, StageRollback) {
+					return fmt.Errorf("%w: campaign %s operation id mismatch", ErrCorruptStorage, id)
 				}
 			} else {
-				// 未开启回滚的活动（含旧存储）不得残留任何回滚进展；
-				// 回滚标识允许缺省（旧存储）或等于稳定标识（新存储）。
-				if dd.Rollback.ID != "" && dd.Rollback.ID != wantRB {
+				wantDL := operationID(id, dd.DeviceID, StageDownload)
+				wantIN := operationID(id, dd.DeviceID, StageInstall)
+				wantRB := operationID(id, dd.DeviceID, StageRollback)
+				if dd.Download.ID != wantDL || dd.Install.ID != wantIN {
+					return fmt.Errorf("%w: campaign %s operation id mismatch", ErrCorruptStorage, id)
+				}
+				if dc.RollbackOnFailure {
+					if dd.Rollback.ID != wantRB {
+						return fmt.Errorf("%w: campaign %s rollback op id mismatch", ErrCorruptStorage, id)
+					}
+				} else if dd.Rollback.ID != "" && dd.Rollback.ID != wantRB {
+					// 未开启回滚的旧活动：回滚标识允许缺省或等于旧稳定标识。
 					return fmt.Errorf("%w: campaign %s rollback op id mismatch", ErrCorruptStorage, id)
 				}
+			}
+			if !dc.RollbackOnFailure {
+				// 未开启回滚的活动（含旧存储）不得残留任何回滚进展。
 				if dd.RollbackTarget != "" ||
 					dd.Rollback.Claimed || dd.Rollback.HasResult ||
 					dd.Status == DeviceAwaitingRollback || dd.Status == DeviceRollingBack ||
@@ -340,8 +356,12 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 			}
 			rbOp := decodeOp(dd.Rollback)
 			if !dc.RollbackOnFailure {
-				// 与创建路径一致：内存中始终持有稳定的回滚操作标识。
-				rbOp = opState{ID: wantRB}
+				// 与创建路径一致：内存中始终持有本方案稳定的回滚操作标识。
+				if dc.IDScheme == opIDSchemeV2 {
+					rbOp = opState{ID: dd.Rollback.ID}
+				} else {
+					rbOp = opState{ID: operationID(id, dd.DeviceID, StageRollback)}
+				}
 			}
 			cd := &campaignDevice{
 				DeviceID:       dd.DeviceID,
@@ -392,9 +412,12 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 			if dr.Stage == StageRollback && !dc.RollbackOnFailure {
 				return fmt.Errorf("%w: campaign %s rollback result in non-rollback campaign", ErrCorruptStorage, id)
 			}
-			wantOp := operationID(id, dr.DeviceID, dr.Stage)
-			if dr.OperationID != wantOp {
-				return fmt.Errorf("%w: campaign %s result op id mismatch", ErrCorruptStorage, id)
+			if dc.IDScheme == opIDSchemeLegacy {
+				// 旧方案标识可按（活动, 设备, 阶段）直接重算；新方案标识的
+				// 归属已在设备操作校验中确认，这里靠下方的历史对账锚定。
+				if wantOp := operationID(id, dr.DeviceID, dr.Stage); dr.OperationID != wantOp {
+					return fmt.Errorf("%w: campaign %s result op id mismatch", ErrCorruptStorage, id)
+				}
 			}
 			if seenHistory[dr.OperationID] {
 				return fmt.Errorf("%w: campaign %s duplicated result history", ErrCorruptStorage, id)

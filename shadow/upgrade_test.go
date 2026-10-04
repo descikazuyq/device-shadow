@@ -219,7 +219,7 @@ func TestClaimWindowOnlineAndStableID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if op == nil || op.ID != "cmp-1:d1:download" || op.Kind != StageDownload {
+	if op == nil || op.ID != encodeOperationIDV2(0, "cmp-1", "d1", StageDownload) || op.Kind != StageDownload {
 		t.Fatalf("claim in window: %+v", op)
 	}
 	wantID := op.ID
@@ -478,7 +478,7 @@ func TestResultIdempotencyAndConflicts(t *testing.T) {
 		t.Fatalf("conflict: %v", err)
 	}
 	// 跳过阶段：直接提交尚未领取的安装
-	in := "cmp-1:d1:install"
+	in := findDevice(v2, "d1").InstallID
 	if err := s.SubmitResult(OperationResult{
 		CampaignID: spec.ID, DeviceID: "d1", OperationID: in,
 		At: upBase.Add(11 * time.Minute), Success: true,
@@ -493,7 +493,7 @@ func TestResultIdempotencyAndConflicts(t *testing.T) {
 		t.Fatalf("other device op: %v", err)
 	}
 	if err := s.SubmitResult(OperationResult{
-		CampaignID: spec.ID, DeviceID: "d2", OperationID: "cmp-1:d2:download",
+		CampaignID: spec.ID, DeviceID: "d2", OperationID: findDevice(v2, "d2").DownloadID,
 		At: upBase.Add(12 * time.Minute), Success: true,
 	}); !errors.Is(err, ErrOperationNotClaimed) {
 		t.Fatalf("unclaimed own op: %v", err)
@@ -750,7 +750,9 @@ func TestUpgradePersistenceReopen(t *testing.T) {
 		t.Fatalf("campaign view: %+v", v)
 	}
 	d1 := findDevice(v, "d1")
-	if d1.Status != DeviceReady || d1.DownloadID != "cmp-1:d1:download" || d1.InstallID != "cmp-1:d1:install" {
+	if d1.Status != DeviceReady ||
+		d1.DownloadID != encodeOperationIDV2(0, "cmp-1", "d1", StageDownload) ||
+		d1.InstallID != encodeOperationIDV2(0, "cmp-1", "d1", StageInstall) {
 		t.Fatalf("d1 state/ids: %+v", d1)
 	}
 	// 时间倒退判断延续
@@ -1139,8 +1141,9 @@ func TestInvalidSubmissionAtDeadlineDoesNotEndCampaign(t *testing.T) {
 		t.Fatalf("unknown op: %v", err)
 	}
 	if err := s.SubmitResult(OperationResult{
-		CampaignID: spec.ID, DeviceID: "d1", OperationID: spec.ID + ":d1:install",
-		At: deadline, Success: true,
+		CampaignID: spec.ID, DeviceID: "d1",
+		OperationID: findDevice(mustGetCampaign(s, spec.ID), "d1").InstallID,
+		At:          deadline, Success: true,
 	}); !errors.Is(err, ErrOperationNotClaimed) {
 		t.Fatalf("unclaimed stage: %v", err)
 	}

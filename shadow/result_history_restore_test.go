@@ -510,7 +510,8 @@ func setupInstallFailure(t *testing.T, rollback bool) (*Store, string, CampaignS
 	}); err != nil {
 		t.Fatalf("install failure: %v", err)
 	}
-	return s, s.dir, spec, &Operation{ID: operationID(spec.ID, "d1", StageRollback)}
+	rbID := findDevice(mustGetCampaign(s, spec.ID), "d1").RollbackID
+	return s, s.dir, spec, &Operation{ID: rbID}
 }
 
 // TestResultHistorySuccessWithExtraReasonReopen 提交成功结果时附带了非空原因
