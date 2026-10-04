@@ -532,6 +532,26 @@ func (s *Store) restore(data []byte) error {
 			return fmt.Errorf("%w: device %s desired config not explained by audit",
 				ErrCorruptStorage, id)
 		}
+		// 差异计时记录必须与双方当前配置重新计算出的差异完全一致：
+		// 每条实际差异都要有一条非零的首次出现时间，记录中也不能残留
+		// 当前已经没有差异的路径（父路径不能代替子路径，路径不同即使
+		// 条数相同也不行）。没有差异时允许不保存记录或保存空记录。
+		entries := computeDiff(d.Desired, d.Reported)
+		if len(entries) != len(d.DiffSince) {
+			return fmt.Errorf("%w: device %s diff times do not match current diff paths",
+				ErrCorruptStorage, id)
+		}
+		for _, e := range entries {
+			since, ok := d.DiffSince[e.Path]
+			if !ok {
+				return fmt.Errorf("%w: device %s diff %s missing first-seen time",
+					ErrCorruptStorage, id, e.Path)
+			}
+			if since.IsZero() {
+				return fmt.Errorf("%w: device %s diff %s has zero first-seen time",
+					ErrCorruptStorage, id, e.Path)
+			}
+		}
 		devices[id] = d
 	}
 	s.devices = devices
