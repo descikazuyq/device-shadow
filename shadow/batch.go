@@ -47,10 +47,13 @@ type batchDeviceState struct {
 //
 // 请求标识在当前存储内唯一：相同标识再次提交相同内容（设备次序、JSON
 // 空白与对象字段顺序无关，数字按数值比较，时间按同一时刻判断）直接返回
-// 首次结果，不重复修改；相同标识提交不同内容返回 ErrRequestConflict，
-// 原结果保持有效。任一设备校验失败（列表为空、标识为空或重复、设备未
-// 登记、配置非法、修订号冲突）时整批报错，所有设备状态、审计均不变，
-// 也不占用请求标识。离线设备同样接受修改。
+// 首次结果，不重复修改；相同标识提交不同内容（更换、增加或减少设备，无
+// 论涉及的设备当前是否登记）返回 ErrRequestConflict，原结果保持有效。
+// 标识首次使用时，任一设备校验失败（列表为空、标识为空或重复、设备未
+// 登记、配置非法、修订号冲突）整批报错，所有设备状态、审计均不变，也
+// 不占用请求标识；标识已有成功记录时仍先做请求自身的格式校验（必填信
+// 息、重复设备、配置格式），非法输入按对应错误拒绝且不影响原记录。离
+// 线设备同样接受修改。
 func (s *Store) BatchUpdateDesired(requestID, operator string, at time.Time, devices []BatchDevice) (BatchRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -69,7 +72,9 @@ func (s *Store) BatchUpdateDesired(requestID, operator string, at time.Time, dev
 	if len(devices) == 0 {
 		return BatchRecord{}, ErrInvalidDeviceList
 	}
-	// 先校验并复制全部输入，再决定是否落库；任何一步失败都不改变状态。
+	// 先校验请求自身的格式并复制全部输入：设备标识非空且不重复、配置都
+	// 是合法的完整 JSON 对象。这些检查与设备是否登记无关，因此对已有成
+	// 功记录的重发同样执行，非法输入按对应错误拒绝，且不影响原记录。
 	type prepared struct {
 		dev *deviceState
 		id  string
@@ -86,23 +91,30 @@ func (s *Store) BatchUpdateDesired(requestID, operator string, at time.Time, dev
 			return BatchRecord{}, fmt.Errorf("%w: %s", ErrDuplicateDevice, bd.DeviceID)
 		}
 		seen[bd.DeviceID] = true
-		d, ok := s.devices[bd.DeviceID]
-		if !ok {
-			return BatchRecord{}, fmt.Errorf("%w: %s", ErrDeviceNotFound, bd.DeviceID)
-		}
 		cfg, err := validateConfig(bd.Config)
 		if err != nil {
 			return BatchRecord{}, err
 		}
-		items = append(items, prepared{dev: d, id: bd.DeviceID, rev: bd.Revision, cfg: cfg})
+		items = append(items, prepared{id: bd.DeviceID, rev: bd.Revision, cfg: cfg})
 	}
 	// 已成功的请求标识：内容一致直接返回首次结果（即使设备此后已有新
-	// 修改，也不用旧请求覆盖）；内容不同返回可区分的冲突错误。
+	// 修改，也不用旧请求覆盖）；内容不同（含更换或增删设备，无论涉及
+	// 的设备当前是否登记）返回可区分的冲突错误。此判断不要求引用设备
+	// 仍然登记，因此必须在设备登记与修订号校验之前完成。
 	if rec, ok := s.batches[requestID]; ok {
 		if rec.matches(operator, at, devices) {
 			return rec.record(), nil
 		}
 		return BatchRecord{}, fmt.Errorf("%w: %s", ErrRequestConflict, requestID)
+	}
+	// 尚未成功使用过的标识执行整批校验：逐项关联已登记设备，任何一步
+	// 失败都不改变状态、也不留下成功请求记录。
+	for i := range items {
+		d, ok := s.devices[items[i].id]
+		if !ok {
+			return BatchRecord{}, fmt.Errorf("%w: %s", ErrDeviceNotFound, items[i].id)
+		}
+		items[i].dev = d
 	}
 	// 修订号冲突检查在任何修改之前完成，失败整批不变。
 	for _, it := range items {
