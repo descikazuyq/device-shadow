@@ -473,6 +473,25 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 					ErrCorruptStorage, id, want.deviceID, want.stage)
 			}
 		}
+		// 已接受的安装/回滚成功记录都附带保存了一条设备上报，必须与设备影子
+		// 对账：序号必须是已被影子接受的正整数，不能大于影子最近接受的序号；
+		// 两边序号相等时这条记录就是设备最近一次上报，版本、完整上报配置和
+		// 首次接受时保存的发生时间都必须与影子一致。序号较小则是被后续上报
+		// 覆盖的历史记录，不要求等于当前影子。活动是否结束都不豁免此项检查，
+		// 任一台设备的一条成功记录矛盾都拒绝打开整个存储。
+		for _, cd := range c.Devices {
+			d := s.devices[cd.DeviceID]
+			if cd.Install.HasResult && cd.Install.Success {
+				if err := validateSuccessReportShadow(id, cd.DeviceID, StageInstall, cd.Install, d); err != nil {
+					return err
+				}
+			}
+			if dc.RollbackOnFailure && cd.Rollback.HasResult && cd.Rollback.Success {
+				if err := validateSuccessReportShadow(id, cd.DeviceID, StageRollback, cd.Rollback, d); err != nil {
+					return err
+				}
+			}
+		}
 		// 活动整体结论必须与设备进度一致：任一设备仍处于非终态（等待下载、
 		// 下载中、等待安装、安装中、等待回滚、回滚中），活动必须 running 且
 		// Ended 为 false；全部设备终态时活动必须已结束，且只有每台设备都
@@ -608,6 +627,43 @@ func isRollbackFlowStatus(status string) bool {
 	default:
 		return false
 	}
+}
+
+// validateSuccessReportShadow 对账一条已接受的安装/回滚成功记录附带保存的
+// 设备上报与设备当前影子：成功记录必须携带正整数序号，且不能大于设备影子
+// 最近接受的序号——序号缺失（零）、尚未被影子接受（大于设备记录）都说明
+// 这条“成功”从未与影子一起被接受，按损坏拒绝。
+//
+// 两边序号相等时，这条成功记录代表的就是设备最近一次上报，因此版本、完整
+// 上报配置和首次接受结果时保存的发生时间必须分别等于影子保存的版本、上报
+// 配置和最近上报时间。序号较小则是已被后续上报覆盖的历史记录，不要求其
+// 版本、配置或时间等于当前影子。配置比较沿用 rawEqual 语义（忽略对象字段
+// 顺序与空白、数字按数值比较），时间按同一时刻判断。
+func validateSuccessReportShadow(campaignID, deviceID, stage string, o opState, d *deviceState) error {
+	bad := func(msg string) error {
+		return fmt.Errorf("%w: campaign %s device %s %s success report %s",
+			ErrCorruptStorage, campaignID, deviceID, stage, msg)
+	}
+	if o.ResultSeq == 0 {
+		return bad("missing accepted sequence")
+	}
+	if o.ResultSeq > d.LastSeq {
+		return bad(fmt.Sprintf("sequence %d exceeds device last accepted %d", o.ResultSeq, d.LastSeq))
+	}
+	if o.ResultSeq < d.LastSeq {
+		// 已被更大序号的后续上报覆盖：当时的版本、配置与时间不再体现在影子中。
+		return nil
+	}
+	if o.ResultVersion != d.Version {
+		return bad("version does not match device shadow")
+	}
+	if !rawEqual(o.ResultConfig, d.Reported) {
+		return bad("config does not match device shadow")
+	}
+	if !o.At.Equal(d.LastReportTime) {
+		return bad("time does not match device last report time")
+	}
+	return nil
 }
 
 // validateRollbackDisk 校验开启回滚的活动中单台设备的回滚状态自洽。
