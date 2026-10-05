@@ -558,14 +558,11 @@ func (s *Store) Claim(campaignID, deviceID string, at time.Time) (*Operation, er
 			current := s.devices[deviceID].Version
 			if !containsString(s.versions[c.Target].AllowedFrom, current) {
 				reason := fmt.Sprintf("version %s is not compatible with target %s", current, c.Target)
-				// 该设备在下载阶段失败：领取即触发，记录阶段、原因和时间。
+				// 该设备在下载阶段失败：领取即触发，按统一的失败记录规则
+				// 接受这次下载失败（记录阶段、原因和时间），不产生回滚。
 				cd.Download.Claimed = true
 				cd.Download.ClaimedAt = at
-				cd.Download.HasResult = true
-				cd.Download.Success = false
-				cd.Download.Reason = reason
-				cd.Download.At = at
-				s.failDevice(c, cd, StageDownload, reason, at)
+				s.acceptFailure(c, cd, StageDownload, reason, at)
 				reject = fmt.Errorf("%w: device %s version %s", ErrIncompatibleVersion, deviceID, current)
 				return nil
 			}
@@ -603,14 +600,8 @@ func (s *Store) Claim(campaignID, deviceID string, at time.Time) (*Operation, er
 // 操作信息一致：标识、活动、设备与阶段固定；仅回滚操作携带首次领取下载时
 // 锁定的目标版本（普通上报不能改写它），下载与安装的目标版本始终为空。
 func stageOperation(c *campaignState, cd *campaignDevice, stage string) *Operation {
-	op := &Operation{CampaignID: c.ID, DeviceID: cd.DeviceID, Kind: stage}
-	switch stage {
-	case StageDownload:
-		op.ID = cd.Download.ID
-	case StageInstall:
-		op.ID = cd.Install.ID
-	case StageRollback:
-		op.ID = cd.Rollback.ID
+	op := &Operation{ID: opFor(cd, stage).ID, CampaignID: c.ID, DeviceID: cd.DeviceID, Kind: stage}
+	if stage == StageRollback {
 		op.TargetVersion = cd.RollbackTarget
 	}
 	return op
@@ -685,14 +676,13 @@ func (s *Store) SubmitResult(res OperationResult) error {
 	// 定位操作标识所属阶段；不属于本设备的操作一律视为未知。
 	var stage string
 	var op *opState
-	switch res.OperationID {
-	case cd.Download.ID:
-		stage, op = StageDownload, &cd.Download
-	case cd.Install.ID:
-		stage, op = StageInstall, &cd.Install
-	case cd.Rollback.ID:
-		stage, op = StageRollback, &cd.Rollback
-	default:
+	for _, st := range []string{StageDownload, StageInstall, StageRollback} {
+		if o := opFor(cd, st); o.ID == res.OperationID {
+			stage, op = st, o
+			break
+		}
+	}
+	if op == nil {
 		return fmt.Errorf("%w: %s", ErrOperationNotFound, res.OperationID)
 	}
 	// 已接受结果：相同结果幂等（活动结束后仍有效，不增加历史、不重复放行），
@@ -774,24 +764,16 @@ func (s *Store) SubmitResult(res OperationResult) error {
 			return nil
 		}
 		c.LastTime = res.At
-		op.HasResult = true
-		op.Success = res.Success
-		op.Reason = res.Reason
-		op.At = res.At
 		if !res.Success {
-			switch {
-			case stage == StageInstall && c.RollbackOnFailure:
-				// 安装失败：保留原因和时间，设备转入等待回滚（非终态）；
-				// 同批其他设备继续，后续批次立即记为未执行，活动暂不结束。
-				s.enterRollback(c, cd, res.Reason, res.At)
-			case stage == StageRollback:
-				// 回滚失败必须给出原因：设备以回滚失败结束且影子不变。
-				s.finishRollbackFailure(c, cd, res.Reason, res.At)
-			default:
-				s.failDevice(c, cd, stage, res.Reason, res.At)
-			}
+			// 失败结果按统一规则接受：操作结果、结果历史与设备后续状态
+			// 都在 acceptFailure 一处记录，三种阶段不再分别维护。
+			s.acceptFailure(c, cd, stage, res.Reason, res.At)
 			return nil
 		}
+		op.HasResult = true
+		op.Success = true
+		op.Reason = res.Reason
+		op.At = res.At
 		switch stage {
 		case StageDownload:
 			cd.Status = DeviceReady
@@ -853,42 +835,55 @@ func resultMatches(op *opState, res OperationResult) bool {
 	return true
 }
 
-// enterRollback 在开启回滚的活动中处理已接受的安装失败：
-// 保留原安装失败的原因与时间，令设备等待回滚（非终态）；
-// 同批其他设备可继续，后续批次立即记为未执行，但活动暂不结束。
-func (s *Store) enterRollback(c *campaignState, cd *campaignDevice, reason string, at time.Time) {
-	cd.Status = DeviceAwaitingRollback
-	cd.Phase = StageRollback
-	cd.Reason = reason
-	cd.At = at
+// acceptFailure 接受一次失败结果并按统一规则记录，是下载失败、安装失败
+// （含开启回滚时）与回滚失败共用的唯一记录入口：
+// 先在操作上记下首次接受的原因与时间，再向结果历史追加恰好一条记录
+// （对应这台设备、这次操作与所处阶段），最后按阶段与活动配置决定设备的
+// 后续状态。失败结果本身不更新设备版本、在线状态或上报配置，也不修改
+// 期望配置、修订号及审计。调用前须已校验原因非空、操作已领取且尚未接受
+// 结果、提交时间早于截止时间。
+func (s *Store) acceptFailure(c *campaignState, cd *campaignDevice, stage, reason string, at time.Time) {
+	op := opFor(cd, stage)
+	op.HasResult = true
+	op.Success = false
+	op.Reason = reason
+	op.At = at
 	c.Results = append(c.Results, ResultRecord{
 		DeviceID:    cd.DeviceID,
-		OperationID: cd.Install.ID,
-		Stage:       StageInstall,
+		OperationID: op.ID,
+		Stage:       stage,
 		Success:     false,
 		Reason:      reason,
 		At:          at,
 	})
-	skipLaterBatches(c, cd, at)
-	// 不结束活动：设备进入非终态的等待回滚，活动要等其回滚结束。
-}
-
-// finishRollbackFailure 处理已接受的回滚失败：必须给出原因，
-// 设备以回滚失败结束，影子不变（失败结果不附带、不应用上报）。
-func (s *Store) finishRollbackFailure(c *campaignState, cd *campaignDevice, reason string, at time.Time) {
-	cd.Status = DeviceRollbackFailed
-	cd.Phase = StageRollback
-	cd.Reason = reason
-	cd.At = at
-	c.Results = append(c.Results, ResultRecord{
-		DeviceID:    cd.DeviceID,
-		OperationID: cd.Rollback.ID,
-		Stage:       StageRollback,
-		Success:     false,
-		Reason:      reason,
-		At:          at,
-	})
-	s.settle(c, at)
+	switch {
+	case stage == StageInstall && c.RollbackOnFailure:
+		// 安装失败且开启回滚：保留原失败原因与时间，设备转入等待回滚
+		// （非终态）；同批其他设备继续，后续批次立即记为未执行，
+		// 活动不结束，要等回滚结束。
+		cd.Status = DeviceAwaitingRollback
+		cd.Phase = StageRollback
+		cd.Reason = reason
+		cd.At = at
+		skipLaterBatches(c, cd, at)
+	case stage == StageRollback:
+		// 回滚失败：设备以回滚失败结束，影子不变。
+		cd.Status = DeviceRollbackFailed
+		cd.Phase = StageRollback
+		cd.Reason = reason
+		cd.At = at
+		s.settle(c, at)
+	default:
+		// 下载失败（含领取前复查版本不兼容）或未开启回滚时的安装失败：
+		// 设备失败，同批其他设备继续，后续批次记为未执行；
+		// 全部设备进入终态时活动失败结束。
+		cd.Status = DeviceFailed
+		cd.Phase = stage
+		cd.Reason = reason
+		cd.At = at
+		skipLaterBatches(c, cd, at)
+		s.settle(c, at)
+	}
 }
 
 // skipLaterBatches 把后续批次中尚未结束的设备立即记为未执行。
@@ -903,33 +898,15 @@ func skipLaterBatches(c *campaignState, cd *campaignDevice, at time.Time) {
 	}
 }
 
-// failDevice 将设备记为失败，记录阶段、原因和时间；后续批次全部记为未执行，
-// 本批其他设备继续。若全部设备已到终态，则活动以失败结束。
-func (s *Store) failDevice(c *campaignState, cd *campaignDevice, phase, reason string, at time.Time) {
-	cd.Status = DeviceFailed
-	cd.Phase = phase
-	cd.Reason = reason
-	cd.At = at
-	c.Results = append(c.Results, ResultRecord{
-		DeviceID:    cd.DeviceID,
-		OperationID: opIDFor(cd, phase),
-		Stage:       phase,
-		Success:     false,
-		Reason:      reason,
-		At:          at,
-	})
-	skipLaterBatches(c, cd, at)
-	s.settle(c, at)
-}
-
-func opIDFor(cd *campaignDevice, phase string) string {
-	switch phase {
+// opFor 返回设备在指定阶段的操作状态，是（设备, 阶段）到操作状态的唯一映射。
+func opFor(cd *campaignDevice, stage string) *opState {
+	switch stage {
 	case StageInstall:
-		return cd.Install.ID
+		return &cd.Install
 	case StageRollback:
-		return cd.Rollback.ID
+		return &cd.Rollback
 	default:
-		return cd.Download.ID
+		return &cd.Download
 	}
 }
 
