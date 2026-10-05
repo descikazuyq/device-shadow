@@ -522,8 +522,8 @@ func (s *Store) Claim(campaignID, deviceID string, at time.Time) (*Operation, er
 		}
 		c.LastTime = at
 		// 已领取但未完成的操作：查询仍返回原标识，不要求在线或位于窗口内。
-		if out := outstandingOp(c, cd); out != nil {
-			op = out
+		if stage, claimed := pendingStage(cd); claimed {
+			op = stageOperation(c, cd, stage)
 			return nil
 		}
 		// 安装失败已接受、等待回滚：回滚是该设备的善后操作，不受批次放行影响。
@@ -540,13 +540,7 @@ func (s *Store) Claim(campaignID, deviceID string, at time.Time) (*Operation, er
 			cd.Status = DeviceRollingBack
 			cd.Phase = StageRollback
 			cd.At = at
-			op = &Operation{
-				ID:            cd.Rollback.ID,
-				CampaignID:    c.ID,
-				DeviceID:      deviceID,
-				Kind:          StageRollback,
-				TargetVersion: cd.RollbackTarget,
-			}
+			op = stageOperation(c, cd, StageRollback)
 			return nil
 		}
 		// 尚未领取的新阶段：先看批次是否放行（不放行时无操作可领）。
@@ -584,7 +578,7 @@ func (s *Store) Claim(campaignID, deviceID string, at time.Time) (*Operation, er
 			cd.Download.ClaimedAt = at
 			cd.Status = DeviceDownloading
 			cd.At = at
-			op = &Operation{ID: cd.Download.ID, CampaignID: c.ID, DeviceID: deviceID, Kind: StageDownload}
+			op = stageOperation(c, cd, StageDownload)
 			return nil
 		}
 		// 下载已成功：领取安装（尚未领取的安装仍须在线且位于窗口内）。
@@ -592,7 +586,7 @@ func (s *Store) Claim(campaignID, deviceID string, at time.Time) (*Operation, er
 		cd.Install.ClaimedAt = at
 		cd.Status = DeviceInstalling
 		cd.At = at
-		op = &Operation{ID: cd.Install.ID, CampaignID: c.ID, DeviceID: deviceID, Kind: StageInstall}
+		op = stageOperation(c, cd, StageInstall)
 		return nil
 	})
 	if err != nil {
@@ -604,24 +598,46 @@ func (s *Store) Claim(campaignID, deviceID string, at time.Time) (*Operation, er
 	return op, nil
 }
 
-// outstandingOp 返回设备已领取但尚无结果的操作；没有则返回 nil。
-func outstandingOp(c *campaignState, cd *campaignDevice) *Operation {
+// stageOperation 构造某一阶段对外呈现（查询待办或领取返回）的操作描述。
+// 同一（设备, 阶段）的描述只在这一处组装，保证查询到的待办与实际领取到的
+// 操作信息一致：标识、活动、设备与阶段固定；仅回滚操作携带首次领取下载时
+// 锁定的目标版本（普通上报不能改写它），下载与安装的目标版本始终为空。
+func stageOperation(c *campaignState, cd *campaignDevice, stage string) *Operation {
+	op := &Operation{CampaignID: c.ID, DeviceID: cd.DeviceID, Kind: stage}
+	switch stage {
+	case StageDownload:
+		op.ID = cd.Download.ID
+	case StageInstall:
+		op.ID = cd.Install.ID
+	case StageRollback:
+		op.ID = cd.Rollback.ID
+		op.TargetVersion = cd.RollbackTarget
+	}
+	return op
+}
+
+// pendingStage 解析设备当前仍待完成的阶段（至多一个）及其是否已领取。
+// 这是待办判定的唯一来源，查询与领取共用，避免同一阶段的操作信息分别维护：
+// 已领取但尚无结果的下载/安装/回滚（claimed=true）；否则等待回滚时为尚未
+// 领取的回滚；下载成功后为尚未领取的安装；其余非终态为尚未领取的下载。
+// 设备已结束自己的步骤（终态）时返回空阶段。
+func pendingStage(cd *campaignDevice) (stage string, claimed bool) {
 	switch {
 	case cd.Download.Claimed && !cd.Download.HasResult:
-		return &Operation{ID: cd.Download.ID, CampaignID: c.ID, DeviceID: cd.DeviceID, Kind: StageDownload}
+		return StageDownload, true
 	case cd.Install.Claimed && !cd.Install.HasResult:
-		return &Operation{ID: cd.Install.ID, CampaignID: c.ID, DeviceID: cd.DeviceID, Kind: StageInstall}
+		return StageInstall, true
 	case cd.Rollback.Claimed && !cd.Rollback.HasResult:
-		// 已领取但未完成的回滚再次领取仍返回同一标识，并继续告知恢复目标版本。
-		return &Operation{
-			ID:            cd.Rollback.ID,
-			CampaignID:    c.ID,
-			DeviceID:      cd.DeviceID,
-			Kind:          StageRollback,
-			TargetVersion: cd.RollbackTarget,
-		}
+		return StageRollback, true
+	case isTerminal(cd.Status):
+		return "", false
+	case cd.Status == DeviceAwaitingRollback:
+		return StageRollback, false
+	case cd.Download.HasResult:
+		// 下载已成功、安装尚未领取（ready）。
+		return StageInstall, false
 	default:
-		return nil
+		return StageDownload, false
 	}
 }
 
@@ -1201,29 +1217,14 @@ func (s *Store) GetDeviceWork(deviceID string) (DeviceWork, error) {
 			continue
 		}
 		cd := c.Devices[i]
-		w.CampaignID = id
-		if out := outstandingOp(c, cd); out != nil {
-			w.Pending = out
-			w.PendingClaimed = true
-		} else if cd.Status == DeviceAwaitingRollback {
-			// 回滚待领取：显示回滚目标，标记为尚未领取。
-			w.Pending = &Operation{
-				ID:            cd.Rollback.ID,
-				CampaignID:    c.ID,
-				DeviceID:      deviceID,
-				Kind:          StageRollback,
-				TargetVersion: cd.RollbackTarget,
-			}
-			w.PendingClaimed = false
-		} else if !isTerminal(cd.Status) {
-			kind := StageDownload
-			id := cd.Download.ID
-			if cd.Download.HasResult {
-				kind, id = StageInstall, cd.Install.ID
-			}
-			w.Pending = &Operation{ID: id, CampaignID: c.ID, DeviceID: deviceID, Kind: kind}
-			w.PendingClaimed = false
+		// 设备已结束自己的步骤但活动尚未结束时，仍保留活动标识、不再有待办；
+		// pendingStage 是待办判定的唯一来源，stageOperation 是描述的唯一来源，
+		// 因而这里看到的标识/目标与 Claim 实际领取到的操作完全一致。
+		if stage, claimed := pendingStage(cd); stage != "" {
+			w.Pending = stageOperation(c, cd, stage)
+			w.PendingClaimed = claimed
 		}
+		w.CampaignID = id
 		break
 	}
 	return w, nil
