@@ -853,41 +853,50 @@ func resultMatches(op *opState, res OperationResult) bool {
 	return true
 }
 
-// enterRollback 在开启回滚的活动中处理已接受的安装失败：
-// 保留原安装失败的原因与时间，令设备等待回滚（非终态）；
-// 同批其他设备可继续，后续批次立即记为未执行，但活动暂不结束。
-func (s *Store) enterRollback(c *campaignState, cd *campaignDevice, reason string, at time.Time) {
-	cd.Status = DeviceAwaitingRollback
-	cd.Phase = StageRollback
-	cd.Reason = reason
-	cd.At = at
-	c.Results = append(c.Results, ResultRecord{
+// failureResultRecord 按统一规则组装一次已接受失败结果的结果历史条目：
+// 对应设备、该阶段的操作标识、失败标记以及首次接受的原因与发生时间。
+// 下载失败、安装失败与回滚失败的历史条目只在这一处生成，共同记录要求
+// 变化时不必分别改动几种失败处理。
+func failureResultRecord(cd *campaignDevice, stage, reason string, at time.Time) ResultRecord {
+	return ResultRecord{
 		DeviceID:    cd.DeviceID,
-		OperationID: cd.Install.ID,
-		Stage:       StageInstall,
+		OperationID: opIDFor(cd, stage),
+		Stage:       stage,
 		Success:     false,
 		Reason:      reason,
 		At:          at,
-	})
+	}
+}
+
+// recordFailureResult 落实一次已接受失败结果的共同记录规则：设备的失败原因与
+// 发生时间、以及结果历史中恰好一条失败记录只在这一处维护。失败结果本身不更新
+// 设备版本、在线状态或上报配置，也不修改期望配置、修订号及审计；失败后设备
+// 走向（直接失败/等待回滚/回滚失败）、批次级联与活动是否结束仍由各调用处按
+// 现有差异分别处理。
+func (s *Store) recordFailureResult(c *campaignState, cd *campaignDevice, stage, reason string, at time.Time) {
+	cd.Reason = reason
+	cd.At = at
+	c.Results = append(c.Results, failureResultRecord(cd, stage, reason, at))
+}
+
+// enterRollback 在开启回滚的活动中处理已接受的安装失败：
+// 按统一规则记录原安装失败的原因与时间，令设备等待回滚（非终态）；
+// 同批其他设备可继续，后续批次立即记为未执行，但活动暂不结束。
+func (s *Store) enterRollback(c *campaignState, cd *campaignDevice, reason string, at time.Time) {
+	s.recordFailureResult(c, cd, StageInstall, reason, at)
+	cd.Status = DeviceAwaitingRollback
+	cd.Phase = StageRollback
 	skipLaterBatches(c, cd, at)
 	// 不结束活动：设备进入非终态的等待回滚，活动要等其回滚结束。
 }
 
 // finishRollbackFailure 处理已接受的回滚失败：必须给出原因，
-// 设备以回滚失败结束，影子不变（失败结果不附带、不应用上报）。
+// 按统一规则记录回滚失败后设备以回滚失败结束，影子不变
+// （失败结果不附带、不应用上报）。
 func (s *Store) finishRollbackFailure(c *campaignState, cd *campaignDevice, reason string, at time.Time) {
+	s.recordFailureResult(c, cd, StageRollback, reason, at)
 	cd.Status = DeviceRollbackFailed
 	cd.Phase = StageRollback
-	cd.Reason = reason
-	cd.At = at
-	c.Results = append(c.Results, ResultRecord{
-		DeviceID:    cd.DeviceID,
-		OperationID: cd.Rollback.ID,
-		Stage:       StageRollback,
-		Success:     false,
-		Reason:      reason,
-		At:          at,
-	})
 	s.settle(c, at)
 }
 
@@ -903,21 +912,12 @@ func skipLaterBatches(c *campaignState, cd *campaignDevice, at time.Time) {
 	}
 }
 
-// failDevice 将设备记为失败，记录阶段、原因和时间；后续批次全部记为未执行，
-// 本批其他设备继续。若全部设备已到终态，则活动以失败结束。
+// failDevice 将设备记为失败：按统一规则记录阶段、原因和时间；后续批次全部
+// 记为未执行，本批其他设备继续。若全部设备已到终态，则活动以失败结束。
 func (s *Store) failDevice(c *campaignState, cd *campaignDevice, phase, reason string, at time.Time) {
+	s.recordFailureResult(c, cd, phase, reason, at)
 	cd.Status = DeviceFailed
 	cd.Phase = phase
-	cd.Reason = reason
-	cd.At = at
-	c.Results = append(c.Results, ResultRecord{
-		DeviceID:    cd.DeviceID,
-		OperationID: opIDFor(cd, phase),
-		Stage:       phase,
-		Success:     false,
-		Reason:      reason,
-		At:          at,
-	})
 	skipLaterBatches(c, cd, at)
 	s.settle(c, at)
 }
