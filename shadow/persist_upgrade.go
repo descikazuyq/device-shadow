@@ -347,9 +347,19 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 				if _, ok := decodeObject(dd.Install.ResultConfig); !ok {
 					return fmt.Errorf("%w: campaign %s install config invalid", ErrCorruptStorage, id)
 				}
+				if err := checkSuccessReport(id, dd, dd.Install, StageInstall, s.devices[dd.DeviceID]); err != nil {
+					return err
+				}
 			}
 			if dc.RollbackOnFailure {
 				if err := validateRollbackDisk(id, dd); err != nil {
+					return err
+				}
+			}
+			if dd.Rollback.HasResult && dd.Rollback.Success {
+				// 未开启回滚的活动存在回滚结果已在上方拒绝；这里只需核对
+				// 开启回滚的活动中已接受的回滚成功记录。
+				if err := checkSuccessReport(id, dd, dd.Rollback, StageRollback, s.devices[dd.DeviceID]); err != nil {
 					return err
 				}
 			}
@@ -572,6 +582,42 @@ func checkCampaignTimeBaseline(campaignID string, c *campaignState) error {
 				return bad("before device %s %s result time %s",
 					cd.DeviceID, item.stage, item.op.At.Format(time.RFC3339Nano))
 			}
+		}
+	}
+	return nil
+}
+
+// checkSuccessReport 核对一条已接受的安装/回滚成功记录保存的附带上报与
+// 对应设备影子最近接受的上报之间的关系。序号必须是正整数且不大于设备最近
+// 接受的序号：缺失、为零或大于设备记录都按损坏处理。两边序号相等时，这条
+// 成功记录代表的就是设备最近一次上报，其版本、完整上报配置与首次接受结果时
+// 保存的发生时间必须分别与影子保存的版本、上报配置和最近上报时间一致
+// （配置按 JSON 语义比较，时间按同一时刻判断，不因时区表示不同而报错）。
+// 序号更小则是已被后续上报覆盖的历史记录，不要求与当前影子一致。
+// 设备当前是否在线不影响本核对；下载结果、失败结果与没有成功结果的阶段
+// 不保存附带上报序号，也不进入本核对。
+func checkSuccessReport(campaignID string, dd diskDev, o diskOp, stage string, d *deviceState) error {
+	bad := func(format string, args ...any) error {
+		msg := fmt.Sprintf(format, args...)
+		return fmt.Errorf("%w: campaign %s device %s %s success report %s",
+			ErrCorruptStorage, campaignID, dd.DeviceID, stage, msg)
+	}
+	if o.ResultSeq == 0 {
+		return bad("missing report sequence")
+	}
+	if o.ResultSeq > d.LastSeq {
+		return bad("sequence %d not accepted by device (last accepted %d)", o.ResultSeq, d.LastSeq)
+	}
+	if o.ResultSeq == d.LastSeq {
+		if o.ResultVersion != d.Version {
+			return bad("version %s does not match latest reported version %s", o.ResultVersion, d.Version)
+		}
+		if !rawEqual(o.ResultConfig, d.Reported) {
+			return bad("config does not match latest reported config")
+		}
+		if !o.At.Equal(d.LastReportTime) {
+			return bad("time %s does not match latest report time %s",
+				o.At.Format(time.RFC3339Nano), d.LastReportTime.Format(time.RFC3339Nano))
 		}
 	}
 	return nil
