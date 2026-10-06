@@ -968,25 +968,40 @@ func (s *Store) applyTimeout(c *campaignState, at time.Time) {
 	c.EndedAt = at
 }
 
-// settle 在全部设备到达终态时结束活动：全部成功则成功，否则失败。
-// 即使回滚成功，设备也不是 succeeded，活动仍为失败。
-func (s *Store) settle(c *campaignState, at time.Time) {
+// campaignConclusion 按设备进度推导活动应有的结论，是活动结束判定的唯一来源：
+// 接收设备结果后的 settle 与打开已有存储时的结论核对都使用它，保证两处规则一致。
+// 任一设备仍处于非终态（等待下载、下载中、等待安装、安装中、等待回滚、回滚中），
+// 活动必须继续执行（ended=false，status 为 running），不能因某台设备已经成功或
+// 失败就结束整个活动；设备离线或维护窗口结束只是暂时无法领取新操作，不影响本判断。
+// 全部设备到达终态时活动必须已结束，且只有每台设备都 succeeded 才能 succeeded，
+// 其余组合（失败、超时、未执行，以及回滚成功/失败/超时——回滚成功只是恢复原版本，
+// 不算本次升级成功）只能 failed。
+func campaignConclusion(c *campaignState) (ended bool, status string) {
 	allSucceeded := true
 	for _, cd := range c.Devices {
 		if !isTerminal(cd.Status) {
-			return
+			return false, CampaignRunning
 		}
 		if cd.Status != DeviceSucceeded {
 			allSucceeded = false
 		}
 	}
+	if allSucceeded {
+		return true, CampaignSucceeded
+	}
+	return true, CampaignFailed
+}
+
+// settle 在全部设备到达终态时结束活动：全部成功则成功，否则失败。
+// 即使回滚成功，设备也不是 succeeded，活动仍为失败。
+func (s *Store) settle(c *campaignState, at time.Time) {
+	ended, status := campaignConclusion(c)
+	if !ended {
+		return
+	}
 	c.Ended = true
 	c.EndedAt = at
-	if allSucceeded {
-		c.Status = CampaignSucceeded
-	} else {
-		c.Status = CampaignFailed
-	}
+	c.Status = status
 }
 
 func isTerminal(status string) bool {
