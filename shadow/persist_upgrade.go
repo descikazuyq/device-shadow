@@ -510,6 +510,12 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 		if err := checkCampaignBatchRelease(id, c); err != nil {
 			return err
 		}
+		// 每个已领取操作的首次领取时间必须落在活动保存的原维护窗口内；
+		// 窗口外的首次领取不能当作有效进度接受，也不能靠挪动领取时间、
+		// 撤销领取或重写进度来消除矛盾。
+		if err := checkCampaignClaimWindow(id, c); err != nil {
+			return err
+		}
 		// 时间基线必须能解释全部已存在的业务记录，否则重开后本应被拒绝的
 		// 旧时间请求又能推进活动。不能抬高基线或改写任何记录来掩盖矛盾。
 		if err := checkCampaignTimeBaseline(id, c); err != nil {
@@ -566,6 +572,46 @@ func checkCampaignBatchRelease(campaignID string, c *campaignState) error {
 				return fmt.Errorf("%w: campaign %s device %s download claimed at %s before device %s install succeeded at %s",
 					ErrCorruptStorage, campaignID, cd.DeviceID,
 					claimedAt.Format(time.RFC3339Nano), prev.DeviceID, prev.Install.At.Format(time.RFC3339Nano))
+			}
+		}
+	}
+	return nil
+}
+
+// checkCampaignClaimWindow 核对每个已领取的下载/安装/回滚操作的首次领取时间
+// 都落在活动保存的原维护窗口 [start, end) 内：开始时刻包含、结束时刻不包含。
+// 首次领取必须遵守维护窗口——早于开始或恰好到达、晚于结束的领取记录都使整个
+// 存储损坏，即使其余状态与结果历史完全自洽、活动仍在执行或已成功/失败结束、
+// 该操作后来成功、失败或超时，也不能把窗口外的首次领取当作有效进度接受，
+// 更不能通过挪动领取时间、撤销领取、删去活动或重写进度来消除矛盾。
+// 这项核对只针对真正首次领取的时刻：尚未领取的操作没有领取时间（等待下载、
+// 等待安装、等待回滚及未领取便结束的记录），属正常缺省，不参与核对；未开启
+// 回滚的活动内存中只有缺省的回滚操作标识，不算已领取。已经在窗口内领取的
+// 操作，后来在窗口外的重复查询、截止前的结果接受以及活动结束时间都不要求
+// 重新满足窗口。比较按绝对时刻进行，时区写法不同不视为矛盾。
+func checkCampaignClaimWindow(campaignID string, c *campaignState) error {
+	for _, cd := range c.Devices {
+		ops := []struct {
+			stage string
+			op    *opState
+		}{
+			{StageDownload, &cd.Download},
+			{StageInstall, &cd.Install},
+			{StageRollback, &cd.Rollback},
+		}
+		for _, item := range ops {
+			if !item.op.Claimed {
+				continue
+			}
+			at := item.op.ClaimedAt
+			// 窗口为 [start, end)：恰好到达开始合法，恰好到达结束不合法。
+			// time.Time 的比较按绝对时刻进行，同一时刻的不同时区写法结果相同。
+			if at.Before(c.WindowStart) || !at.Before(c.WindowEnd) {
+				return fmt.Errorf("%w: campaign %s device %s %s first claimed at %s outside maintenance window [%s, %s)",
+					ErrCorruptStorage, campaignID, cd.DeviceID, item.stage,
+					at.Format(time.RFC3339Nano),
+					c.WindowStart.Format(time.RFC3339Nano),
+					c.WindowEnd.Format(time.RFC3339Nano))
 			}
 		}
 	}
