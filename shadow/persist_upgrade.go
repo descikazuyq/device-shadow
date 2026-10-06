@@ -521,6 +521,12 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 		if err := checkCampaignTimeBaseline(id, c); err != nil {
 			return err
 		}
+		// 已接受结果的操作，其首次结果发生时间不得早于该操作自己的首次领取
+		// 时间；结果先于领取发生在因果上不可能，不能靠其他设备的领取时间、
+		// 设备影子的最近上报时间或活动结束时间把它“合法化”。
+		if err := checkCampaignResultOrder(id, c); err != nil {
+			return err
+		}
 		out[id] = c
 	}
 	// 设备不能同时参加多个未结束活动。
@@ -661,6 +667,48 @@ func checkCampaignTimeBaseline(campaignID string, c *campaignState) error {
 			if item.op.HasResult && !item.op.At.IsZero() && baseline.Before(item.op.At) {
 				return bad("before device %s %s result time %s",
 					cd.DeviceID, item.stage, item.op.At.Format(time.RFC3339Nano))
+			}
+		}
+	}
+	return nil
+}
+
+// checkCampaignResultOrder 校验每个已经接受结果的下载/安装/回滚操作，其首次
+// 结果发生时间都不早于该操作自己的首次领取时间：同一活动、同一设备、同一阶段
+// 的两个时刻直接比较，成功与失败适用同一规则。结果先于领取在因果上不可能，
+// 必须使整个存储拒绝打开；不能用其他设备的领取时间、设备影子的最近上报时间、
+// 活动的最新时间或结束时间替代这两个时刻，也不能通过修改时间、删除结果历史、
+// 撤销领取或改变设备状态让记录变得合法。后来安装成功或回滚完成同样不能掩盖
+// 早先阶段的矛盾，因此该核对对仍在执行和已结束的活动都生效。
+// 只比较该操作自己确实存在的两个时刻：尚未接受结果（含已领取未完成、随后因
+// 截止超时）的操作没有结果时间，尚未领取的等待步骤没有领取时间，均属正常
+// 缺省，跳过核对。首次领取时因版本不兼容而直接形成的下载失败，领取与失败
+// 可以是同一时刻；两时刻相等合法。已领取操作在窗口结束后、截止前提交结果
+// 不受限制——本核对不要求结果落在维护窗口内。比较按绝对时刻进行，时区写法
+// 不同不视为矛盾。重复提交不覆盖首次记录，这里使用的就是首次接受的两个时刻。
+func checkCampaignResultOrder(campaignID string, c *campaignState) error {
+	for _, cd := range c.Devices {
+		ops := []struct {
+			stage string
+			op    *opState
+		}{
+			{StageDownload, &cd.Download},
+			{StageInstall, &cd.Install},
+			{StageRollback, &cd.Rollback},
+		}
+		for _, item := range ops {
+			o := item.op
+			// 未接受结果（含已领取未完成、超时）或未领取的操作不参与核对：
+			// HasResult 为 true 时上方的操作校验已保证 Claimed 且两个时间非零。
+			if !o.HasResult {
+				continue
+			}
+			// time.Time 的比较按绝对时刻进行：结果早于首次领取即损坏，
+			// 相同时刻的不同时区写法结果相同，相等合法。
+			if o.At.Before(o.ClaimedAt) {
+				return fmt.Errorf("%w: campaign %s device %s %s result at %s before first claim at %s",
+					ErrCorruptStorage, campaignID, cd.DeviceID, item.stage,
+					o.At.Format(time.RFC3339Nano), o.ClaimedAt.Format(time.RFC3339Nano))
 			}
 		}
 	}
