@@ -513,6 +513,15 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 					ErrCorruptStorage, id, c.Status)
 			}
 		}
+		// 批次放行顺序必须与保存的升级结果自洽：任一设备首次领取下载时，
+		// 较早批次的每台设备都必须已经首次接受“安装成功”结果，且其成功
+		// 时间不晚于该次下载领取时间。只看活动保存的结果，不看设备当前在线
+		// 状态或当前版本；下载成功、安装中、安装失败后等待回滚、已回滚等
+		// 都不算放行。该核对对仍在执行和已结束的活动都生效，下载后来的
+		// 成功、失败或超时不能掩盖首次领取时越批的矛盾。
+		if err := checkCampaignBatchRelease(id, c); err != nil {
+			return err
+		}
 		// 时间基线必须能解释全部已存在的业务记录，否则重开后本应被拒绝的
 		// 旧时间请求又能推进活动。不能抬高基线或改写任何记录来掩盖矛盾。
 		if err := checkCampaignTimeBaseline(id, c); err != nil {
@@ -535,6 +544,43 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 		}
 	}
 	s.campaigns = out
+	return nil
+}
+
+// checkCampaignBatchRelease 核对活动的批次放行顺序与保存的升级结果自洽：
+// 任一已经领取过下载的设备，在其首次领取下载时，所有较早批次的设备都必须
+// 已经成功完成安装，且每台前序设备首次接受安装成功结果的时间不晚于该次
+// 下载的首次领取时间。只按活动保存的升级结果判断：设备当前是否在线、当前
+// 版本是否恰好等于目标版本都不能替代前序安装成功；前序设备仅下载成功、
+// 正在安装、安装失败后等待回滚或已经回滚成功均不满足放行条件。
+// 尚未领取下载的设备（正常等待后批、因前批失败而未执行、未领取即随截止
+// 超时）不参与核对，也不能仅因前批没有成功而拒绝。时间按同一时刻比较，
+// 时区写法不同不视为矛盾；同一时刻合法。核对对仍在执行和已结束的活动都
+// 生效，下载后来成功、失败或超时都不能掩盖首次领取时越过前批的问题。
+func checkCampaignBatchRelease(campaignID string, c *campaignState) error {
+	for _, cd := range c.Devices {
+		if !cd.Download.Claimed || cd.Download.ClaimedAt.IsZero() {
+			continue
+		}
+		claimedAt := cd.Download.ClaimedAt
+		for _, prev := range c.Devices {
+			if prev.Batch >= cd.Batch {
+				// 同批设备各自推进，不等待同批其他设备；更晚批次不相关。
+				continue
+			}
+			if !(prev.Install.HasResult && prev.Install.Success) {
+				return fmt.Errorf("%w: campaign %s device %s download claimed while previous-batch device %s not installed",
+					ErrCorruptStorage, campaignID, cd.DeviceID, prev.DeviceID)
+			}
+			// time.Time 的比较按绝对时刻进行，不因时区写法不同而拒绝
+			// 相同时刻；安装成功时刻晚于下载领取时刻即属越批领取，相等合法。
+			if prev.Install.At.After(claimedAt) {
+				return fmt.Errorf("%w: campaign %s device %s download claimed at %s before device %s install succeeded at %s",
+					ErrCorruptStorage, campaignID, cd.DeviceID,
+					claimedAt.Format(time.RFC3339Nano), prev.DeviceID, prev.Install.At.Format(time.RFC3339Nano))
+			}
+		}
+	}
 	return nil
 }
 
