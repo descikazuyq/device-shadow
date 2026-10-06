@@ -727,14 +727,19 @@ func validateRollbackDisk(campaignID string, dd diskDev) error {
 	if isRollbackFlowStatus(dd.Status) && dd.RollbackTarget == "" {
 		return bad("rollback status without locked target")
 	}
+	// 处于回滚流程（等待/进行中/任一回滚终态）的唯一前提是本设备在本活动
+	// 中的安装已被接受为失败：安装尚未领取、已领取但尚无结果、或安装结果
+	// 为成功，都不能支持这些回滚状态。回滚目标非空、操作标识合法、回滚结果
+	// 与历史一致或活动已结束都不能替代这一前提；当前版本恰好等于旧版本、
+	// 下载失败，以及其他设备或其他活动的失败记录也都不是本次安装失败。
+	if isRollbackFlowStatus(dd.Status) && !(dd.Install.HasResult && !dd.Install.Success) {
+		return bad("rollback state without accepted install failure")
+	}
 	switch dd.Status {
 	case DeviceAwaitingRollback:
 		// 已接受安装失败、回滚尚未领取：回滚无结果。
 		if dd.Phase != StageRollback || rb.Claimed || rb.HasResult {
 			return bad("awaiting rollback state mismatch")
-		}
-		if !(dd.Install.HasResult && !dd.Install.Success) {
-			return bad("awaiting rollback without install failure")
 		}
 	case DeviceRollingBack:
 		if dd.Phase != StageRollback || !rb.Claimed || rb.HasResult {
