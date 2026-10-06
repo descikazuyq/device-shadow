@@ -518,6 +518,11 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 		if err := checkCampaignTimeBaseline(id, c); err != nil {
 			return err
 		}
+		// 批次放行顺序必须与保存的升级结果自洽：任何已领取下载的设备，
+		// 首次领取时较早批次必须已全部安装成功。
+		if err := checkBatchReleaseOrder(id, c); err != nil {
+			return err
+		}
 		out[id] = c
 	}
 	// 设备不能同时参加多个未结束活动。
@@ -581,6 +586,41 @@ func checkCampaignTimeBaseline(campaignID string, c *campaignState) error {
 			if item.op.HasResult && !item.op.At.IsZero() && baseline.Before(item.op.At) {
 				return bad("before device %s %s result time %s",
 					cd.DeviceID, item.stage, item.op.At.Format(time.RFC3339Nano))
+			}
+		}
+	}
+	return nil
+}
+
+// checkBatchReleaseOrder 核对批次放行顺序：对活动中任何已经领取过下载的设备，
+// 所有较早批次的设备都必须已经安装成功（succeeded），且每台前序设备首次接受
+// 安装成功结果的时间不晚于这次下载的首次领取时间。只按活动保存的升级结果判断：
+// 前序设备下载成功、正在安装、安装失败后等待回滚或已回滚成功都不满足放行条件，
+// 不能用设备当前是否在线、当前版本是否恰好等于目标版本替代；同一批内的设备
+// 互不等待。尚未领取下载的设备（等待放行、因前批失败未执行、或随活动截止超时）
+// 没有领取时间，不参与本核对，也不仅因前批没有成功而被拒绝。比较按实际时刻
+// 进行，相等合法，不因时区写法不同而冲突。活动仍在执行或已经结束、下载后来
+// 成功/失败/超时，都不影响对首次领取时刻的核对。
+func checkBatchReleaseOrder(campaignID string, c *campaignState) error {
+	for _, cd := range c.Devices {
+		if !cd.Download.Claimed {
+			continue
+		}
+		claimAt := cd.Download.ClaimedAt
+		for _, other := range c.Devices {
+			if other.Batch >= cd.Batch {
+				continue
+			}
+			if other.Status != DeviceSucceeded {
+				return fmt.Errorf("%w: campaign %s device %s download claimed before earlier batch device %s succeeded",
+					ErrCorruptStorage, campaignID, cd.DeviceID, other.DeviceID)
+			}
+			// succeeded 的设备必有已接受的安装成功结果及非零时间（前面已校验）。
+			if other.Install.At.After(claimAt) {
+				return fmt.Errorf("%w: campaign %s device %s download claimed at %s before earlier batch device %s install succeeded at %s",
+					ErrCorruptStorage, campaignID, cd.DeviceID,
+					claimAt.Format(time.RFC3339Nano), other.DeviceID,
+					other.Install.At.Format(time.RFC3339Nano))
 			}
 		}
 	}
