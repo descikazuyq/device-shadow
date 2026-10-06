@@ -516,6 +516,11 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 		if err := checkCampaignClaimWindow(id, c); err != nil {
 			return err
 		}
+		// 已接受结果的操作，其首次结果发生时间不能早于该操作自身的首次领取
+		// 时间；不能用其他设备的领取时间、影子最近上报时间或活动结束时间替代。
+		if err := checkCampaignResultOrder(id, c); err != nil {
+			return err
+		}
 		// 时间基线必须能解释全部已存在的业务记录，否则重开后本应被拒绝的
 		// 旧时间请求又能推进活动。不能抬高基线或改写任何记录来掩盖矛盾。
 		if err := checkCampaignTimeBaseline(id, c); err != nil {
@@ -612,6 +617,54 @@ func checkCampaignClaimWindow(campaignID string, c *campaignState) error {
 					at.Format(time.RFC3339Nano),
 					c.WindowStart.Format(time.RFC3339Nano),
 					c.WindowEnd.Format(time.RFC3339Nano))
+			}
+		}
+	}
+	return nil
+}
+
+// checkCampaignResultOrder 核对每个已经接受结果的下载/安装/回滚操作，其首次
+// 结果发生时间（op.At）不早于该操作自身的首次领取时间（同一活动、同一设备、
+// 同一阶段的 ClaimedAt）。“结果已经发生，操作后来才首次领取”的记录没有任何
+// 合法产生路径：即使领取在维护窗口内、结果与结果历史一致、活动最新时间覆盖
+// 这些时刻，也不能接受这种时间倒置，更不能通过修改时间、删除结果历史、撤销
+// 领取或改变设备状态让记录变得合法。
+// 判断只依据该操作自己的两个时刻：不能用其他设备的领取时间、设备影子的最近
+// 上报时间或活动结束时间替代，后来安装成功或回滚完成也不能掩盖早先阶段的
+// 矛盾。成功与失败适用同一规则；首次领取时因版本不兼容直接形成的下载失败，
+// 领取与失败为同一时刻，属合法（相等允许）。结果可以在维护窗口结束后、截止前
+// 提交，因此这里不要求结果落在维护窗口内。
+// 尚未接受结果的操作（已领取未完成、等待领取，以及随后因截止而超时的操作）
+// 没有结果时间，不参与核对；未领取的等待步骤同样跳过。比较按绝对时刻进行，
+// 同一时刻的不同时区写法不视为矛盾。该核对对仍在执行和已结束的活动都生效。
+func checkCampaignResultOrder(campaignID string, c *campaignState) error {
+	for _, cd := range c.Devices {
+		ops := []struct {
+			stage string
+			op    *opState
+		}{
+			{StageDownload, &cd.Download},
+			{StageInstall, &cd.Install},
+			{StageRollback, &cd.Rollback},
+		}
+		for _, item := range ops {
+			if !item.op.HasResult {
+				// 已领取未完成、等待领取及因截止超时的操作都没有结果时间，
+				// 不因缺少结果时间触发本错误。
+				continue
+			}
+			// HasResult 的操作必然已领取（恢复路径在前面已按损坏拒绝未领取
+			// 的结果），这里只防御性跳过零值领取时间。
+			if item.op.ClaimedAt.IsZero() {
+				continue
+			}
+			// 只比较该操作自己的结果时间与首次领取时间：时间按绝对时刻判断，
+			// 时区写法不同不影响；两个时刻相等允许打开，结果早于领取即损坏。
+			if item.op.At.Before(item.op.ClaimedAt) {
+				return fmt.Errorf("%w: campaign %s device %s %s result at %s before its own first claim at %s",
+					ErrCorruptStorage, campaignID, cd.DeviceID, item.stage,
+					item.op.At.Format(time.RFC3339Nano),
+					item.op.ClaimedAt.Format(time.RFC3339Nano))
 			}
 		}
 	}
