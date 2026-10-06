@@ -311,8 +311,25 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 					return fmt.Errorf("%w: campaign %s failed device without failed result", ErrCorruptStorage, id)
 				}
 			}
-			if dd.Status == DeviceReady && !(dd.Download.HasResult && dd.Download.Success) {
-				return fmt.Errorf("%w: campaign %s ready device without download", ErrCorruptStorage, id)
+			// ready（等待安装）与 installing（正在安装）都必须有本设备在该活动中
+			// 已接受的下载成功结果，并停留在安装阶段：等待安装表示安装从未领取、
+			// 尚无安装结果；正在安装表示安装已经领取、但还没有接受安装结果。
+			// 即使操作标识、时间和结果历史各自合法，也不能把已有安装结果（成功
+			// 或失败）的设备解释成这两种状态。核对只依据本设备在该活动中的操作
+			// 记录，不能借用同批其他设备的下载成功，也不能用当前版本已经等于
+			// 目标版本替代下载或安装结果。尚未领取安装时没有领取时间、尚无结果
+			// 时没有结果时间，仍是正常缺省，不在此拒绝。
+			switch dd.Status {
+			case DeviceReady:
+				if !(dd.Download.HasResult && dd.Download.Success) || dd.Phase != StageInstall ||
+					dd.Install.Claimed || dd.Install.HasResult {
+					return fmt.Errorf("%w: campaign %s ready device state mismatch", ErrCorruptStorage, id)
+				}
+			case DeviceInstalling:
+				if !(dd.Download.HasResult && dd.Download.Success) || dd.Phase != StageInstall ||
+					!dd.Install.Claimed || dd.Install.HasResult {
+					return fmt.Errorf("%w: campaign %s installing device state mismatch", ErrCorruptStorage, id)
+				}
 			}
 			ops := []diskOp{dd.Download, dd.Install}
 			if dc.RollbackOnFailure {
