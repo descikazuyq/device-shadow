@@ -311,8 +311,10 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 					return fmt.Errorf("%w: campaign %s failed device without failed result", ErrCorruptStorage, id)
 				}
 			}
-			if dd.Status == DeviceReady && !(dd.Download.HasResult && dd.Download.Success) {
-				return fmt.Errorf("%w: campaign %s ready device without download", ErrCorruptStorage, id)
+			// ready（等待安装）与 installing（正在安装）都必须停留在安装阶段，
+			// 且只能依据本设备在本活动保存的下载/安装操作记录核对。
+			if err := validateInstallStageDisk(id, dd); err != nil {
+				return err
 			}
 			ops := []diskOp{dd.Download, dd.Install}
 			if dc.RollbackOnFailure {
@@ -782,6 +784,52 @@ func isRollbackFlowStatus(status string) bool {
 	default:
 		return false
 	}
+}
+
+// validateInstallStageDisk 校验 ready（等待安装）与 installing（正在安装）两种
+// 设备状态与本设备在本活动中保存的操作进度一致。两种状态都必须已有本设备接受
+// 的下载成功结果并停留在安装阶段：ready 表示安装从未领取、尚无安装结果；
+// installing 表示安装已经领取、但还没有接受安装结果。即使操作标识、时间与结果
+// 历史各自合法，已完成安装（安装成功或失败已有结果）的设备也不能解释成仍在
+// 等待或正在安装，安装已经领取的记录同样不能停在 ready。核对只看本设备本活动
+// 的下载/安装操作记录：不能借用同批其他设备的下载成功，也不能用设备当前版本
+// 恰好等于目标版本替代下载或安装结果。尚未领取安装时没有安装领取时间、尚无
+// 安装结果时没有结果时间，是正常缺省；设备离线、维护窗口已结束或普通上报改变
+// 了当前版本都不在此核对范围内。矛盾一律返回 ErrCorruptStorage，拒绝打开整个
+// 存储，不通过调整状态、撤销领取、删除历史或补造结果消除矛盾。
+func validateInstallStageDisk(campaignID string, dd diskDev) error {
+	bad := func(msg string) error {
+		return fmt.Errorf("%w: campaign %s device %s %s", ErrCorruptStorage, campaignID, dd.DeviceID, msg)
+	}
+	switch dd.Status {
+	case DeviceReady, DeviceInstalling:
+	default:
+		return nil
+	}
+	if dd.Phase != StageInstall {
+		return bad("install-stage status without install phase")
+	}
+	// 两种状态都必须有本设备在本活动中已接受的下载成功结果。
+	if !(dd.Download.HasResult && dd.Download.Success) {
+		return bad("install-stage status without accepted download success")
+	}
+	switch dd.Status {
+	case DeviceReady:
+		// 等待安装：安装从未领取、尚无安装结果；没有安装领取时间与结果时间
+		// 是正常缺省。安装已领取或已有成功/失败结果都与 ready 矛盾。
+		if dd.Install.Claimed || dd.Install.HasResult {
+			return bad("ready state with install claimed or resulted")
+		}
+	case DeviceInstalling:
+		// 正在安装：安装已经领取，但还没有接受安装结果（成功或失败都不行）。
+		if !dd.Install.Claimed {
+			return bad("installing state without install claim")
+		}
+		if dd.Install.HasResult {
+			return bad("installing state with install result")
+		}
+	}
+	return nil
 }
 
 // validateRollbackDisk 校验开启回滚的活动中单台设备的回滚状态自洽。
