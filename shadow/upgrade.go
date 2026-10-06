@@ -963,30 +963,69 @@ func (s *Store) applyTimeout(c *campaignState, at time.Time) {
 		cd.Reason = "deadline exceeded"
 		cd.At = at
 	}
-	c.Status = CampaignFailed
-	c.Ended = true
-	c.EndedAt = at
+	// 超时处理后所有设备都已终态，结论仍由同一套设备进度规则给出（必为失败）。
+	applyConclusion(c, deriveCampaignConclusion(c), at)
 }
 
-// settle 在全部设备到达终态时结束活动：全部成功则成功，否则失败。
-// 即使回滚成功，设备也不是 succeeded，活动仍为失败。
+// settle 在接收设备结果后按同一套设备进度规则结算活动：仍有未完成设备时
+// 不结束活动、不生成结束时间；全部设备终态时结束，结束时间沿用本次结果
+// （正常情况下即最后一台设备的结果）时间，成败由 deriveCampaignConclusion 决定。
 func (s *Store) settle(c *campaignState, at time.Time) {
-	allSucceeded := true
-	for _, cd := range c.Devices {
-		if !isTerminal(cd.Status) {
-			return
-		}
-		if cd.Status != DeviceSucceeded {
-			allSucceeded = false
-		}
+	cc := deriveCampaignConclusion(c)
+	if !cc.Finished {
+		return
 	}
+	applyConclusion(c, cc, at)
+}
+
+// applyConclusion 把推导结论落到活动字段，结束时间采用调用方给出的时机：
+// 实时结算时是最后一台设备结果的时间，截止处理时是触发截止的时间。
+func applyConclusion(c *campaignState, cc campaignConclusion, at time.Time) {
 	c.Ended = true
 	c.EndedAt = at
-	if allSucceeded {
-		c.Status = CampaignSucceeded
-	} else {
-		c.Status = CampaignFailed
+	c.Status = cc.status()
+}
+
+// campaignConclusion 是按设备进度推导出的活动整体结论，是活动是否结束与
+// 成败判定的唯一来源：接收设备结果后的实时结算与打开已有存储时的结论核对
+// 共用同一套规则。
+type campaignConclusion struct {
+	// Finished 表示活动是否已结束：只有全部设备都进入自己的终态才为 true。
+	Finished bool
+	// Succeeded 仅在 Finished 为 true 时有意义：每台设备都安装成功才为 true。
+	Succeeded bool
+}
+
+// status 返回结论对应的活动状态名；未结束固定为 running。
+func (cc campaignConclusion) status() string {
+	switch {
+	case !cc.Finished:
+		return CampaignRunning
+	case cc.Succeeded:
+		return CampaignSucceeded
+	default:
+		return CampaignFailed
 	}
+}
+
+// deriveCampaignConclusion 只按各设备的当前状态推导活动结论，与设备是否在线、
+// 维护窗口是否结束无关——离线或窗口外只是暂时无法领取新操作，不代表设备步骤
+// 已结束。等待下载（pending）、下载中、等待安装（ready）、安装中、等待回滚
+// 和回滚中都是未完成：任一台处于这些状态，活动就必须继续，不能因同批其他
+// 设备已经成功或失败而提前结束。全部设备终态后，只有每台都安装成功活动才
+// 成功；存在失败、超时、未执行（skipped）或任何回滚终态（回滚成功只是恢复
+// 原版本，本次升级仍未成功）时活动失败。
+func deriveCampaignConclusion(c *campaignState) campaignConclusion {
+	cc := campaignConclusion{Finished: true, Succeeded: true}
+	for _, cd := range c.Devices {
+		if !isTerminal(cd.Status) {
+			cc.Finished = false
+		}
+		if cd.Status != DeviceSucceeded {
+			cc.Succeeded = false
+		}
+	}
+	return cc
 }
 
 func isTerminal(status string) bool {

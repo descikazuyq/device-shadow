@@ -483,35 +483,22 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 					ErrCorruptStorage, id, want.deviceID, want.stage)
 			}
 		}
-		// 活动整体结论必须与设备进度一致：任一设备仍处于非终态（等待下载、
+		// 活动整体结论必须与设备进度一致，判定规则与实时结算完全共用
+		// deriveCampaignConclusion：任一设备仍处于非终态（等待下载、
 		// 下载中、等待安装、安装中、等待回滚、回滚中），活动必须 running 且
 		// Ended 为 false；全部设备终态时活动必须已结束，且只有每台设备都
 		// succeeded 才能 succeeded，其余组合（失败、超时、未执行，以及回滚
 		// 成功/失败/超时——回滚成功只是恢复原版本，不算本次升级成功）只能
-		// failed。设备离线或维护窗口结束不改变这一判断。
-		allTerminal := true
-		allSucceeded := true
-		for _, cd := range c.Devices {
-			if !isTerminal(cd.Status) {
-				allTerminal = false
-			}
-			if cd.Status != DeviceSucceeded {
-				allSucceeded = false
-			}
-		}
-		if !allTerminal {
+		// failed。设备离线或维护窗口结束不改变这一判断。这里只核对已保存的
+		// 结论，不重新结束活动、不补写结束时间或设备进度。
+		cc := deriveCampaignConclusion(c)
+		if !cc.Finished {
 			if c.Ended || c.Status != CampaignRunning {
 				return fmt.Errorf("%w: campaign %s ended while devices unfinished", ErrCorruptStorage, id)
 			}
-		} else {
-			wantStatus := CampaignFailed
-			if allSucceeded {
-				wantStatus = CampaignSucceeded
-			}
-			if !c.Ended || c.Status != wantStatus {
-				return fmt.Errorf("%w: campaign %s status %s does not match device results",
-					ErrCorruptStorage, id, c.Status)
-			}
+		} else if !c.Ended || c.Status != cc.status() {
+			return fmt.Errorf("%w: campaign %s status %s does not match device results",
+				ErrCorruptStorage, id, c.Status)
 		}
 		// 批次放行顺序必须与保存的升级结果自洽：任一设备首次领取下载时，
 		// 较早批次的每台设备都必须已经首次接受“安装成功”结果，且其成功
