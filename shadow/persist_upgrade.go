@@ -510,6 +510,14 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 		if err := checkCampaignBatchRelease(id, c); err != nil {
 			return err
 		}
+		// 每个已领取操作的首次领取时刻都必须落在活动保存的原维护窗口
+		// [start,end) 内。运行时领取已强制窗口，重开时还要防止保存的
+		// 领取时间被挪到窗口外；该核对对仍在执行和已结束的活动、对下载/
+		// 安装/回滚都生效，操作后来的成功、失败或超时都不能掩盖窗口外的
+		// 首次领取。尚未领取的操作没有领取时间，不在此列。
+		if err := checkCampaignClaimWindows(id, c); err != nil {
+			return err
+		}
 		// 时间基线必须能解释全部已存在的业务记录，否则重开后本应被拒绝的
 		// 旧时间请求又能推进活动。不能抬高基线或改写任何记录来掩盖矛盾。
 		if err := checkCampaignTimeBaseline(id, c); err != nil {
@@ -566,6 +574,48 @@ func checkCampaignBatchRelease(campaignID string, c *campaignState) error {
 				return fmt.Errorf("%w: campaign %s device %s download claimed at %s before device %s install succeeded at %s",
 					ErrCorruptStorage, campaignID, cd.DeviceID,
 					claimedAt.Format(time.RFC3339Nano), prev.DeviceID, prev.Install.At.Format(time.RFC3339Nano))
+			}
+		}
+	}
+	return nil
+}
+
+// checkCampaignClaimWindows 核对每个已领取操作的首次领取时刻都位于活动保存
+// 的原维护窗口 [start,end) 内（开始时刻包含、结束时刻不包含）。运行时只有
+// 在线且位于窗口内才能首次领取下载、安装或回滚，因此保存的活动中一旦出现
+// 窗口外的首次领取时间（早于开始、恰好结束或晚于结束），说明存储记录与领取
+// 规则矛盾，必须拒绝打开。
+// 核对只针对真正的首次领取时刻，按绝对时刻比较：带不同时区写法但表示同一
+// 时刻的时间得到相同结果。尚未领取的操作（等待下载、等待安装、等待回滚及
+// 未领取便随截止结束）没有领取时间，不参与核对。已领取的操作后来在窗口外
+// 重复查询、在窗口外截止前提交结果、活动已成功或失败结束，以及该操作后来
+// 成功、失败或超时，都不能让窗口外的首次领取合法化——重复查询时间、结果
+// 接受时间与活动结束时间都不与窗口比较。未开启回滚的活动不检查缺省的回滚
+// 操作，它从未被领取。
+func checkCampaignClaimWindows(campaignID string, c *campaignState) error {
+	check := func(cd *campaignDevice, stage string, op *opState) error {
+		if !op.Claimed || op.ClaimedAt.IsZero() {
+			return nil
+		}
+		at := op.ClaimedAt
+		if at.Before(c.WindowStart) || !at.Before(c.WindowEnd) {
+			return fmt.Errorf("%w: campaign %s device %s %s claimed at %s outside maintenance window [%s, %s)",
+				ErrCorruptStorage, campaignID, cd.DeviceID, stage,
+				at.Format(time.RFC3339Nano),
+				c.WindowStart.Format(time.RFC3339Nano), c.WindowEnd.Format(time.RFC3339Nano))
+		}
+		return nil
+	}
+	for _, cd := range c.Devices {
+		if err := check(cd, StageDownload, &cd.Download); err != nil {
+			return err
+		}
+		if err := check(cd, StageInstall, &cd.Install); err != nil {
+			return err
+		}
+		if c.RollbackOnFailure {
+			if err := check(cd, StageRollback, &cd.Rollback); err != nil {
+				return err
 			}
 		}
 	}
