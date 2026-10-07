@@ -311,6 +311,11 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 					return fmt.Errorf("%w: campaign %s failed device without failed result", ErrCorruptStorage, id)
 				}
 			}
+			// pending（等待下载）与 downloading（下载中）都必须停留在下载阶段，
+			// 且只能依据本设备在本活动保存的下载操作记录核对。
+			if err := validateDownloadStageDisk(id, dd); err != nil {
+				return err
+			}
 			// ready（等待安装）与 installing（正在安装）都必须停留在安装阶段，
 			// 且只能依据本设备在本活动保存的下载/安装操作记录核对。
 			if err := validateInstallStageDisk(id, dd); err != nil {
@@ -832,6 +837,50 @@ func isRollbackFlowStatus(status string) bool {
 	default:
 		return false
 	}
+}
+
+// validateDownloadStageDisk 校验 pending（等待下载）与 downloading（下载中）
+// 两种设备状态与本设备在本活动中保存的下载操作进度一致。两种状态都只能停留
+// 在下载阶段：pending 表示本设备在本活动中的下载从未领取、尚无下载结果；
+// downloading 表示下载已经领取、但还没有接受任何下载结果。即使操作标识、
+// 时间与结果历史各自合法，已经保存下载成功或失败结果的设备也不能解释成仍在
+// 等待或正在下载，下载已经领取的记录同样不能停在 pending，下载未领取的记录
+// 也不能标成 downloading。阶段已写成安装或回滚同样属于矛盾，不能因为操作
+// 标识、时间和结果历史各自合法就继续接受。核对只看本设备本活动的下载操作
+// 记录：不能借用同批其他设备的领取或下载成功，也不能用设备当前版本恰好等于
+// 目标版本、普通上报改变了版本或配置替代下载领取与结果。尚未领取下载时没有
+// 领取时间、尚无下载结果时没有结果时间，是正常缺省；设备离线、维护窗口已经
+// 结束只影响新操作能否领取，不在此核对范围内。矛盾一律返回 ErrCorruptStorage，
+// 拒绝打开整个存储，不通过调整状态、撤销领取、删除历史或补造结果消除矛盾。
+func validateDownloadStageDisk(campaignID string, dd diskDev) error {
+	bad := func(msg string) error {
+		return fmt.Errorf("%w: campaign %s device %s %s", ErrCorruptStorage, campaignID, dd.DeviceID, msg)
+	}
+	switch dd.Status {
+	case DevicePending, DeviceDownloading:
+	default:
+		return nil
+	}
+	if dd.Phase != StageDownload {
+		return bad("download-stage status without download phase")
+	}
+	switch dd.Status {
+	case DevicePending:
+		// 等待下载：下载从未领取、尚无下载结果；没有领取时间与结果时间是
+		// 正常缺省。下载已领取或已有成功/失败结果都与 pending 矛盾。
+		if dd.Download.Claimed || dd.Download.HasResult {
+			return bad("pending state with download claimed or resulted")
+		}
+	case DeviceDownloading:
+		// 下载中：下载已经领取，但还没有接受下载结果（成功或失败都不行）。
+		if !dd.Download.Claimed {
+			return bad("downloading state without download claim")
+		}
+		if dd.Download.HasResult {
+			return bad("downloading state with download result")
+		}
+	}
+	return nil
 }
 
 // validateInstallStageDisk 校验 ready（等待安装）与 installing（正在安装）两种
