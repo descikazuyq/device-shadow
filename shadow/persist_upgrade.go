@@ -303,12 +303,17 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 				return fmt.Errorf("%w: campaign %s succeeded device without results", ErrCorruptStorage, id)
 			}
 			if dd.Status == DeviceFailed {
-				failedOp := dd.Download
-				if dd.Phase == StageInstall {
-					failedOp = dd.Install
-				}
-				if !failedOp.HasResult || failedOp.Success {
-					return fmt.Errorf("%w: campaign %s failed device without failed result", ErrCorruptStorage, id)
+				// 标为 failed 的设备只能是下载失败，或未开启失败回滚时直接结束
+				// 的安装失败：阶段只能是 download 或 install（回滚阶段失败另有
+				// rollback_failed 状态；开启回滚时安装失败进入回滚流程，也不会
+				// 以此状态结束），且必须对应本设备在本活动中已接受的该阶段失败
+				// 结果。设备状态中的失败原因必须与结果原因逐字一致，失败时间
+				// 必须表示首次接受该结果的同一实际时刻。不能把下载失败写成回滚
+				// 阶段，也不能借同批其他设备、其他活动的失败记录或设备当前影子
+				// 版本来解释它。矛盾一律拒绝打开整个存储，不能跳过该设备提供
+				// 其余记录，也不能改写原因、挪动时间或删去历史使其打开。
+				if err := validateFailedDeviceDisk(id, dd); err != nil {
+					return err
 				}
 			}
 			// pending（等待下载）与 downloading（下载中）都必须停留在下载阶段，
@@ -878,6 +883,56 @@ func validateDownloadStageDisk(campaignID string, dd diskDev) error {
 		if dd.Download.HasResult {
 			return bad("downloading state with download result")
 		}
+	}
+	return nil
+}
+
+// validateFailedDeviceDisk 校验 failed 设备的失败阶段、原因与时间与本设备在
+// 本活动中已接受的失败结果一致。适用于下载失败，以及未开启失败回滚时直接结束
+// 的安装失败（开启回滚的活动中安装失败会进入回滚流程，不以此状态结束；下载
+// 失败在两种活动中都直接 failed）。这样的设备失败阶段只能是 download 或
+// install——回滚阶段的失败另有 rollback_failed 状态，不能把下载失败写成回滚
+// 阶段；且所选阶段必须恰好对应本设备自己在本活动中已接受的该阶段失败结果：
+// 设备状态中的失败原因要与结果原因逐字一致，失败时间要与首次接受该结果的时间
+// 表示同一实际时刻（时区写法不同但时刻相同合法）。
+// 核对只看本设备在本活动中的操作记录：不能借同批其他设备或其他活动的失败
+// 记录解释它，也不能用设备当前影子版本替代失败结果。活动结束时间晚于该设备
+// 失败时间、其他设备仍在处理或已先行失败都不改变本核对。矛盾一律返回
+// ErrCorruptStorage，拒绝打开整个存储：不能只跳过这台设备提供其余记录，也不
+// 能改写原因、挪动时间或删去历史使文件可以打开。
+func validateFailedDeviceDisk(campaignID string, dd diskDev) error {
+	bad := func(msg string) error {
+		return fmt.Errorf("%w: campaign %s device %s %s", ErrCorruptStorage, campaignID, dd.DeviceID, msg)
+	}
+	switch dd.Phase {
+	case StageDownload, StageInstall:
+	default:
+		return bad("failed device phase must be download or install")
+	}
+	// 锚定本设备自己在所选阶段的操作记录：该操作必须已有失败结果。
+	// 开启回滚活动中的安装失败必然进入回滚流程、不会以 failed/install
+	// 结束（由回滚状态校验统一拦截），因此这里只需要核对阶段与结果本身。
+	failedOp := dd.Download
+	if dd.Phase == StageInstall {
+		failedOp = dd.Install
+	}
+	if !failedOp.HasResult || failedOp.Success {
+		return bad("failed device without accepted failed result for its phase")
+	}
+	if failedOp.Reason == "" {
+		return bad("failed result without reason")
+	}
+	if dd.Reason == "" {
+		return bad("failure without reason")
+	}
+	// 设备状态的失败原因必须与已接受失败结果的原因逐字一致。
+	if dd.Reason != failedOp.Reason {
+		return bad("failure reason does not match accepted failed result")
+	}
+	// 设备状态的失败时间必须与首次接受该失败结果的时间表示同一实际时刻；
+	// time.Time 的比较按绝对时刻进行，时区写法不同不视为矛盾。
+	if dd.At.IsZero() || failedOp.At.IsZero() || !dd.At.Equal(failedOp.At) {
+		return bad("failure time does not match accepted failed result time")
 	}
 	return nil
 }
