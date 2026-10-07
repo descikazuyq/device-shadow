@@ -529,6 +529,12 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 		if err := checkCampaignResultOrder(id, c); err != nil {
 			return err
 		}
+		// 已接受结果的操作，其保存的结果时间必须严格早于活动截止时间：
+		// 截止时刻及以后提交的结果在正常流程中不可能被接受，已有存储中
+		// 这样的迟到结果即使其余记录全部自洽也不能被当成有效进度读取。
+		if err := checkCampaignResultDeadline(id, c); err != nil {
+			return err
+		}
 		out[id] = c
 	}
 	// 设备不能同时参加多个未结束活动。
@@ -711,6 +717,51 @@ func checkCampaignResultOrder(campaignID string, c *campaignState) error {
 				return fmt.Errorf("%w: campaign %s device %s %s result at %s before first claim at %s",
 					ErrCorruptStorage, campaignID, cd.DeviceID, item.stage,
 					o.At.Format(time.RFC3339Nano), o.ClaimedAt.Format(time.RFC3339Nano))
+			}
+		}
+	}
+	return nil
+}
+
+// checkCampaignResultDeadline 校验每个已经接受结果的下载/安装/回滚操作，其保存
+// 的首次结果发生时间都严格早于所属活动的截止时间：成功与失败适用同一规则，
+// 恰好等于截止时间也算迟到。正常提交流程中，截止时刻及以后提交的已领取操作
+// 不会被接受为操作结果，而是把未结束设备记为超时；因此已有存储中出现迟到的
+// 已接受结果不可能由正常提交产生，必须使整个存储拒绝打开，不能删除该迟到
+// 结果、调整其时间或把设备改记为超时来继续打开。
+// 即使操作标识、结果历史、设备进度与活动最新时间互相对应，设备后来安装成功、
+// 回滚完成或当前版本已经符合目标，也不能让早先的迟到结果变得合法，因此该核对
+// 对仍在执行和已结束的活动都生效。
+// 只比较该操作自己的结果时间与活动自己的截止时间：尚未接受结果（含已领取
+// 未完成、随后因截止超时）的操作没有结果时间，属正常缺省，跳过核对；活动的
+// 超时状态时间与结束时间可以等于或晚于截止，不能代替操作自己的结果时间参与
+// 判断；普通设备上报时间也不受本项活动结果限制。在窗口内领取的操作可以在窗口
+// 结束后、截止前完成；截止前已接受的结果后来被重复提交时不会改写首次记录，
+// 因此这里使用的始终是首次接受的结果时间，重复提交时间再晚也不构成损坏。
+// 比较按绝对时刻进行，时区写法不同不视为矛盾。
+func checkCampaignResultDeadline(campaignID string, c *campaignState) error {
+	for _, cd := range c.Devices {
+		ops := []struct {
+			stage string
+			op    *opState
+		}{
+			{StageDownload, &cd.Download},
+			{StageInstall, &cd.Install},
+			{StageRollback, &cd.Rollback},
+		}
+		for _, item := range ops {
+			o := item.op
+			// 未接受结果（含已领取未完成、超时）的操作没有结果时间，不参与核对：
+			// HasResult 为 true 时上方的操作校验已保证 Claimed 且结果时间非零。
+			if !o.HasResult {
+				continue
+			}
+			// time.Time 的比较按绝对时刻进行：结果时间不严格早于截止（恰好等于
+			// 或晚于）即迟到，相同时刻的不同时区写法结果相同。
+			if !o.At.Before(c.Deadline) {
+				return fmt.Errorf("%w: campaign %s device %s %s result at %s not before deadline %s",
+					ErrCorruptStorage, campaignID, cd.DeviceID, item.stage,
+					o.At.Format(time.RFC3339Nano), c.Deadline.Format(time.RFC3339Nano))
 			}
 		}
 	}
