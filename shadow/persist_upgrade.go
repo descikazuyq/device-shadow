@@ -1043,6 +1043,22 @@ func validateRollbackDisk(campaignID string, dd diskDev) error {
 		if dd.Phase != StageRollback || !rb.HasResult || rb.Success || rb.Reason == "" {
 			return bad("rollback failed without failure result")
 		}
+		// 设备当前状态中的失败原因必须与本设备在本活动中首次接受的回滚失败
+		// 结果的原因逐字一致（多一个空格也算不同），状态时间必须与首次接受
+		// 该结果的时间表示同一实际时刻（时区写法不同但时刻相同合法）。即使
+		// 回滚操作结果与结果历史彼此自洽，把当前原因写成原安装失败原因或另
+		// 一段文字、把当前时间挪回安装失败或其他时刻，都与已接受的回滚失败
+		// 矛盾；只改原因或只改时间同样不能接受。判断只锚定本设备本活动的
+		// 回滚失败结果：其他设备的失败、原安装失败以及设备当前影子版本都不
+		// 能替代它。同批其他设备后来才结束、活动结束时间晚于本次回滚失败
+		// 时间不构成矛盾。矛盾一律拒绝打开整个存储，不能改写原因、挪动时间
+		// 或删去历史使其打开。
+		if dd.Reason != rb.Reason {
+			return bad("rollback failure reason does not match accepted rollback failure result")
+		}
+		if dd.At.IsZero() || rb.At.IsZero() || !dd.At.Equal(rb.At) {
+			return bad("rollback failure time does not match accepted rollback failure result time")
+		}
 	case DeviceRollbackTimeout:
 		if dd.Phase != StageRollback {
 			return bad("rollback timeout phase mismatch")
