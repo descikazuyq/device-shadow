@@ -476,6 +476,14 @@ func containsString(list []string, v string) bool {
 // 已领取但未完成的操作（下载/安装/回滚）再次查询时返回同一标识，不要求在线或位于窗口内。
 // 离线设备保留待办；离线或窗口外暂无可领取的新操作时返回 (nil, nil)。
 // 时间缺失或相对本活动已接受的时间倒退时拒绝，且不改变状态。
+// 活动仍在执行、领取时间有效（非缺失、不倒退、早于截止）而设备自身的步骤已经结束
+// （成功、失败、未执行，或回滚成功/失败）时，领取是纯拒绝：返回空操作和
+// ErrDeviceFinished（可用 errors.Is 判断），不重新派发操作、不推进时间基线、
+// 不改设备状态/阶段/原因/时间、不增加结果历史、不改设备影子与待办，也不落盘，
+// 因而存储目录不可写时调用方拿到的仍是设备已结束的真实结果，而不是保存错误；
+// 被拒绝的领取时间不会成为活动新的已接受时间，不影响随后更早时间的合法请求。
+// 该判断只看设备是否终态，不依赖设备在线与否或领取时间是否落在维护窗口；
+// 等待回滚与正在回滚不是终态、仍有未完成工作，不在此拒绝范围内。
 // 活动已结束（无论因超时还是提前成功/失败结束、无论领取时间在原截止前、
 // 恰好截止或截止后）时领取是纯拒绝：返回 ErrCampaignEnded，不推进时间基线、
 // 不改活动结论、结束时间、设备状态与状态时间、结果历史和设备影子，也不落盘，
@@ -483,6 +491,8 @@ func containsString(list []string, v string) bool {
 // 活动仍在执行而领取首次到达截止时间时保留原有截止处理：不派发操作，
 // 全部未结束设备按阶段记为超时（等待或正在回滚的记回滚超时），已有终态
 // 保持不变，以本次领取时间结束活动；此次结束时间仍参与后续倒退判断。
+// 即使所选设备早已结束，截止处理仍按整个活动级联，本次实际改变进度仍需保存，
+// 保存失败沿用整体回滚。
 func (s *Store) Claim(campaignID, deviceID string, at time.Time) (*Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -505,21 +515,29 @@ func (s *Store) Claim(campaignID, deviceID string, at time.Time) (*Operation, er
 		// 使随后本来合法的请求被误判为时间倒退。
 		return nil, ErrCampaignEnded
 	}
+	// 到达截止时间：未结束设备全部超时并落盘，本次领取拒绝。
+	// 即使查询的设备已有终态，其他未结束设备仍要级联超时；截止处理按整个
+	// 活动判断，优先于单设备的已结束拒绝。本次确实改变进度，仍需保存，
+	// 保存失败由 commit 整体回滚内存状态。
+	if !at.Before(c.Deadline) {
+		if err := s.commit(func() error {
+			c.LastTime = at
+			s.applyTimeout(c, at)
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+		return nil, ErrCampaignEnded
+	}
+	// 设备自身步骤已结束（终态）而活动仍在等待其他设备：纯拒绝，不进入
+	// commit，因此不尝试保存、不替换存储文件，也不推进时间基线。等待回滚、
+	// 正在回滚不是终态，仍可领取回滚操作，不能归入这一拒绝。
+	if isTerminal(cd.Status) {
+		return nil, fmt.Errorf("%w: %s", ErrDeviceFinished, deviceID)
+	}
 	var op *Operation
 	var reject error
 	err = s.commit(func() error {
-		// 到达截止时间：未结束设备全部超时并落盘，本次领取拒绝。
-		// 即使查询的设备已有终态，其他未结束设备仍要级联超时。
-		if !at.Before(c.Deadline) {
-			c.LastTime = at
-			s.applyTimeout(c, at)
-			reject = ErrCampaignEnded
-			return nil
-		}
-		if isTerminal(cd.Status) {
-			reject = fmt.Errorf("%w: %s", ErrDeviceFinished, deviceID)
-			return nil
-		}
 		c.LastTime = at
 		// 已领取但未完成的操作：查询仍返回原标识，不要求在线或位于窗口内。
 		if stage, claimed := pendingStage(cd); claimed {
