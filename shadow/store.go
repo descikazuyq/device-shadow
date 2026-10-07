@@ -461,8 +461,31 @@ func (s *Store) restore(data []byte) error {
 		if _, ok := decodeObject(ds.Desired); !ok {
 			return fmt.Errorf("%w: device %s desired config invalid", ErrCorruptStorage, id)
 		}
-		if _, ok := decodeObject(ds.Reported); !ok {
+		repObj, ok := decodeObject(ds.Reported)
+		if !ok {
 			return fmt.Errorf("%w: device %s reported config invalid", ErrCorruptStorage, id)
+		}
+		// 每台设备的记录必须能表示“已经登记但从未上报”或“已有一次有效
+		// 上报”：最后上报序号为 0 表示从未上报，此时上报时间必须为零值、
+		// 上报配置必须是空 JSON 对象（按 JSON 内容判断，允许合法空白）、
+		// 设备必须离线；序号为正整数表示已有有效上报，此时必须保存非零的
+		// 上报时间。两种记录的当前版本都必须非空。任一条件不满足都按存储
+		// 损坏拒绝，不自动补时间、改序号、清空上报配置或替换版本。
+		if ds.Version == "" {
+			return fmt.Errorf("%w: device %s version empty", ErrCorruptStorage, id)
+		}
+		if ds.LastSeq == 0 {
+			if !ds.LastReportTime.IsZero() {
+				return fmt.Errorf("%w: device %s never reported but has report time", ErrCorruptStorage, id)
+			}
+			if len(repObj) != 0 {
+				return fmt.Errorf("%w: device %s never reported but has reported config", ErrCorruptStorage, id)
+			}
+			if ds.Online {
+				return fmt.Errorf("%w: device %s never reported but is online", ErrCorruptStorage, id)
+			}
+		} else if ds.LastReportTime.IsZero() {
+			return fmt.Errorf("%w: device %s reported but has no report time", ErrCorruptStorage, id)
 		}
 		d := &deviceState{
 			Version:        ds.Version,
