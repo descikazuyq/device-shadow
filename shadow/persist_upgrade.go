@@ -529,6 +529,12 @@ func (s *Store) restoreCampaigns(disk map[string]diskCampaign) error {
 		if err := checkCampaignResultOrder(id, c); err != nil {
 			return err
 		}
+		// 已接受结果的操作，其首次结果发生时间还必须严格早于活动截止时间；
+		// 截止时刻及以后正常提交路径不再接收结果，已有存储中的迟到结果不能
+		// 当作有效进度读取。
+		if err := checkCampaignResultDeadline(id, c); err != nil {
+			return err
+		}
 		out[id] = c
 	}
 	// 设备不能同时参加多个未结束活动。
@@ -711,6 +717,48 @@ func checkCampaignResultOrder(campaignID string, c *campaignState) error {
 				return fmt.Errorf("%w: campaign %s device %s %s result at %s before first claim at %s",
 					ErrCorruptStorage, campaignID, cd.DeviceID, item.stage,
 					o.At.Format(time.RFC3339Nano), o.ClaimedAt.Format(time.RFC3339Nano))
+			}
+		}
+	}
+	return nil
+}
+
+// checkCampaignResultDeadline 校验每个已经接受结果的下载/安装/回滚操作，其首次
+// 结果发生时间都严格早于所属活动的截止时间：正常提交路径在截止时刻及以后不再
+// 把结果接收为操作结果（已领取未完成的操作随截止记为超时），因此已有存储中
+// 等于或晚于截止的结果时间不可能由正常提交产生，必须使整个存储拒绝打开。
+// 成功与失败适用同一规则；恰好等于截止时间也属于迟到。比较按绝对时刻进行，
+// 时区写法不同不改变判断。该核对对仍在执行和已结束的活动都生效：设备后来
+// 安装成功、回滚完成或当前版本恰好等于目标版本，都不能让早先的迟到结果合法。
+// 只比较操作自己确实保存的结果时间：已领取但尚无结果、随后因截止而超时的操作
+// 没有结果时间，属正常缺省，不参与核对；活动的超时状态时间与结束时间可以等于
+// 或晚于截止，普通设备上报也不受这项限制，这些时间不能代替操作结果时间参与
+// 判断。截止前已接受的结果后来重复提交时不改写首次记录，这里使用的是首次接受
+// 的时刻，不按重复提交时间判断。命中任意一条都必须返回 ErrCorruptStorage，
+// 不能通过删除迟到结果、调整时间或把设备改成超时来继续打开。
+func checkCampaignResultDeadline(campaignID string, c *campaignState) error {
+	for _, cd := range c.Devices {
+		ops := []struct {
+			stage string
+			op    *opState
+		}{
+			{StageDownload, &cd.Download},
+			{StageInstall, &cd.Install},
+			{StageRollback, &cd.Rollback},
+		}
+		for _, item := range ops {
+			o := item.op
+			// 未接受结果（含已领取未完成、随后超时）的操作没有结果时间，
+			// 属正常缺省，跳过核对。
+			if !o.HasResult {
+				continue
+			}
+			// time.Time 的比较按绝对时刻进行：结果不早于截止（相等或更晚）
+			// 即属迟到，同一时刻的不同时区写法判断相同。
+			if !o.At.Before(c.Deadline) {
+				return fmt.Errorf("%w: campaign %s device %s %s result at %s not before deadline %s",
+					ErrCorruptStorage, campaignID, cd.DeviceID, item.stage,
+					o.At.Format(time.RFC3339Nano), c.Deadline.Format(time.RFC3339Nano))
 			}
 		}
 	}
