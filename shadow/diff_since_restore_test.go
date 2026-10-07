@@ -10,16 +10,20 @@ import (
 )
 
 // diffSinceDoc 构造一台唯一差异在 /wifi/ssid 的设备：/mode 双方相等，
-// 时间记录与差异路径一一对应，审计链完整。各用例在此基础上篡改计时记录。
+// 时间记录与差异路径一一对应，审计链完整。设备已经有过一次有效上报
+// （lastSeq 为 1、上报时间非零），各用例在此基础上篡改计时记录。
 func diffSinceDoc() fixStore {
 	at := "2026-10-02T12:00:00Z"
 	return fixStore{Format: 1, Devices: map[string]fixState{
 		"dev-1": {
-			Version:   "1.0",
-			Revision:  1,
-			Desired:   json.RawMessage(`{"wifi":{"ssid":"a"},"mode":"x"}`),
-			Reported:  json.RawMessage(`{"wifi":{"ssid":"b"},"mode":"x"}`),
-			DiffSince: map[string]string{"/wifi/ssid": at},
+			Version:        "1.0",
+			Online:         true,
+			Revision:       1,
+			Desired:        json.RawMessage(`{"wifi":{"ssid":"a"},"mode":"x"}`),
+			Reported:       json.RawMessage(`{"wifi":{"ssid":"b"},"mode":"x"}`),
+			LastSeq:        1,
+			LastReportTime: at,
+			DiffSince:      map[string]string{"/wifi/ssid": at},
 			Audit: []fixAudit{
 				{Operator: "op", Time: at, Revision: 1, Before: json.RawMessage(`{}`),
 					After: json.RawMessage(`{"wifi":{"ssid":"a"},"mode":"x"}`)},
@@ -40,11 +44,14 @@ func TestRestoreDiffSinceAccepted(t *testing.T) {
 		doc := fixStore{Format: 1, Devices: map[string]fixState{
 			"dev-1": {
 				Version:  "1.0",
+				Online:   true,
 				Revision: 1,
 				// 两处差异：/a 与 /wifi/ssid；字段顺序刻意与上报侧不同。
-				Desired:   json.RawMessage(`{"wifi":{"ssid":"a"},"a":1}`),
-				Reported:  json.RawMessage(`{"a":2,"wifi":{"ssid":"b"}}`),
-				DiffSince: map[string]string{"/wifi/ssid": at, "/a": "2026-10-02T12:05:00Z"},
+				Desired:        json.RawMessage(`{"wifi":{"ssid":"a"},"a":1}`),
+				Reported:       json.RawMessage(`{"a":2,"wifi":{"ssid":"b"}}`),
+				LastSeq:        1,
+				LastReportTime: at,
+				DiffSince:      map[string]string{"/wifi/ssid": at, "/a": "2026-10-02T12:05:00Z"},
 				Audit: []fixAudit{
 					{Operator: "op", Time: at, Revision: 1, Before: json.RawMessage(`{}`),
 						After: json.RawMessage(`{"wifi":{"ssid":"a"},"a":1}`)},
@@ -89,11 +96,14 @@ func TestRestoreDiffSinceAccepted(t *testing.T) {
 		}
 		doc := fixStore{Format: 1, Devices: map[string]fixState{
 			"dev-1": {
-				Version:   "1.0",
-				Revision:  1,
-				Desired:   json.RawMessage(desired),
-				Reported:  json.RawMessage(reported),
-				DiffSince: since,
+				Version:        "1.0",
+				Online:         true,
+				Revision:       1,
+				Desired:        json.RawMessage(desired),
+				Reported:       json.RawMessage(reported),
+				LastSeq:        1,
+				LastReportTime: at,
+				DiffSince:      since,
 				Audit: []fixAudit{
 					{Operator: "op", Time: at, Revision: 1, Before: json.RawMessage(`{}`),
 						After: json.RawMessage(desired)},
@@ -124,10 +134,13 @@ func TestRestoreDiffSinceAccepted(t *testing.T) {
 		doc := fixStore{Format: 1, Devices: map[string]fixState{
 			"dev-1": {
 				Version:  "1.0",
+				Online:   true,
 				Revision: 1,
 				// 字段顺序不同、1 与 1.0 等值：无差异，无计时记录。
-				Desired:  json.RawMessage(`{"a":1,"b":{}}`),
-				Reported: json.RawMessage(`{"b":{},"a":1.0}`),
+				Desired:        json.RawMessage(`{"a":1,"b":{}}`),
+				Reported:       json.RawMessage(`{"b":{},"a":1.0}`),
+				LastSeq:        1,
+				LastReportTime: at,
 				Audit: []fixAudit{
 					{Operator: "op", Time: at, Revision: 1, Before: json.RawMessage(`{}`),
 						After: json.RawMessage(`{"a":1,"b":{}}`)},
@@ -245,11 +258,14 @@ func TestRestoreDiffSinceCorruptRefused(t *testing.T) {
 	t.Run("record on device without diffs", func(t *testing.T) {
 		doc := fixStore{Format: 1, Devices: map[string]fixState{
 			"dev-1": {
-				Version:   "1.0",
-				Revision:  1,
-				Desired:   json.RawMessage(`{"a":1}`),
-				Reported:  json.RawMessage(`{"a":1}`),
-				DiffSince: map[string]string{"/a": "2026-10-02T12:00:00Z"},
+				Version:        "1.0",
+				Online:         true,
+				Revision:       1,
+				Desired:        json.RawMessage(`{"a":1}`),
+				Reported:       json.RawMessage(`{"a":1}`),
+				LastSeq:        1,
+				LastReportTime: "2026-10-02T12:00:00Z",
+				DiffSince:      map[string]string{"/a": "2026-10-02T12:00:00Z"},
 				Audit: []fixAudit{
 					{Operator: "op", Time: "2026-10-02T12:00:00Z", Revision: 1,
 						Before: json.RawMessage(`{}`), After: json.RawMessage(`{"a":1}`)},

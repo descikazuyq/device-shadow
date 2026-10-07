@@ -60,6 +60,43 @@ type deviceState struct {
 	Audit     []AuditRecord
 }
 
+// validateLastReport 校验设备记录的最近上报侧必须自洽，只能表示以下两种
+// 形态之一：
+//   - 已经登记但从未上报：LastSeq 为 0，此时上报时间必须为零值、上报配置
+//     必须是空 JSON 对象（按 JSON 内容判断，允许合法空白）、设备必须离线；
+//     期望侧可以已经修改过（期望配置非空、存在审计或配置差异都合法）。
+//   - 已有一次有效上报：LastSeq 为正整数，此时必须保存非零的上报时间；
+//     上报配置允许是空对象，设备也允许随后被标记为离线。
+//
+// 两种形态的当前版本都必须非空。序号允许跳号。校验只检查记录自身的一致性，
+// 不补时间、不改序号、不清空上报配置、不替换版本。
+func (d *deviceState) validateLastReport() error {
+	if d.Version == "" {
+		return errors.New("version is empty")
+	}
+	if d.LastSeq == 0 {
+		if !d.LastReportTime.IsZero() {
+			return errors.New("never-reported device has a last report time")
+		}
+		reported, ok := decodeObject(d.Reported)
+		if !ok {
+			// 理论上 restore 已用 decodeObject 校验过，这里防御性处理。
+			return errors.New("never-reported device reported config invalid")
+		}
+		if len(reported) != 0 {
+			return errors.New("never-reported device has non-empty reported config")
+		}
+		if d.Online {
+			return errors.New("never-reported device is online")
+		}
+		return nil
+	}
+	if d.LastReportTime.IsZero() {
+		return errors.New("reported device has zero last report time")
+	}
+	return nil
+}
+
 // refreshDiff 重新计算差异路径：已有路径保留原时间，新路径使用 t，消失的路径移除。
 func (d *deviceState) refreshDiff(t time.Time) {
 	entries := computeDiff(d.Desired, d.Reported)
@@ -473,6 +510,9 @@ func (s *Store) restore(data []byte) error {
 			LastSeq:        ds.LastSeq,
 			LastReportTime: ds.LastReportTime,
 			DiffSince:      make(map[string]time.Time, len(ds.DiffSince)),
+		}
+		if err := d.validateLastReport(); err != nil {
+			return fmt.Errorf("%w: device %s %v", ErrCorruptStorage, id, err)
 		}
 		for p, t := range ds.DiffSince {
 			d.DiffSince[p] = t
