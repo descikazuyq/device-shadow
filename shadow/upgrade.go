@@ -483,6 +483,11 @@ func containsString(list []string, v string) bool {
 // 活动仍在执行而领取首次到达截止时间时保留原有截止处理：不派发操作，
 // 全部未结束设备按阶段记为超时（等待或正在回滚的记回滚超时），已有终态
 // 保持不变，以本次领取时间结束活动；此次结束时间仍参与后续倒退判断。
+// 活动仍在执行、领取时间早于截止，而设备已结束自己的步骤（成功、失败、
+// 未执行或回滚结束等终态）时，领取同样是纯拒绝：返回空操作和
+// ErrDeviceFinished，不推进时间基线、不改设备状态与结果历史、不替换存储
+// 文件，也不重新派发操作，与设备是否在线、领取时间是否在维护窗口内无关；
+// 等待回滚或正在回滚的设备仍有未完成工作，不属于此列。
 func (s *Store) Claim(campaignID, deviceID string, at time.Time) (*Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -505,21 +510,30 @@ func (s *Store) Claim(campaignID, deviceID string, at time.Time) (*Operation, er
 		// 使随后本来合法的请求被误判为时间倒退。
 		return nil, ErrCampaignEnded
 	}
+	// 到达截止时间：未结束设备全部超时并落盘，本次领取拒绝。
+	// 即使查询的设备已有终态，其他未结束设备仍要级联超时；
+	// 此次确实推进的时间仍参与后续倒退判断，保存失败沿用整体回滚。
+	if !at.Before(c.Deadline) {
+		if err := s.commit(func() error {
+			c.LastTime = at
+			s.applyTimeout(c, at)
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+		return nil, ErrCampaignEnded
+	}
+	// 活动仍在执行而设备已结束自己的步骤（终态）：纯拒绝，返回空操作和
+	// ErrDeviceFinished——不推进时间基线、不改状态、不落盘，也不重新派发
+	// 操作，与设备是否在线、领取时间是否在维护窗口内无关。等待回滚和正在
+	// 回滚的设备不是终态，不在此列。被拒绝的时间不能成为新的已接受时间，
+	// 否则随后其他设备本来合法的较早请求会被误判为时间倒退。
+	if isTerminal(cd.Status) {
+		return nil, fmt.Errorf("%w: %s", ErrDeviceFinished, deviceID)
+	}
 	var op *Operation
 	var reject error
 	err = s.commit(func() error {
-		// 到达截止时间：未结束设备全部超时并落盘，本次领取拒绝。
-		// 即使查询的设备已有终态，其他未结束设备仍要级联超时。
-		if !at.Before(c.Deadline) {
-			c.LastTime = at
-			s.applyTimeout(c, at)
-			reject = ErrCampaignEnded
-			return nil
-		}
-		if isTerminal(cd.Status) {
-			reject = fmt.Errorf("%w: %s", ErrDeviceFinished, deviceID)
-			return nil
-		}
 		c.LastTime = at
 		// 已领取但未完成的操作：查询仍返回原标识，不要求在线或位于窗口内。
 		if stage, claimed := pendingStage(cd); claimed {
